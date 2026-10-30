@@ -32,6 +32,9 @@ private:
     void Run();
     void HandleClient(HANDLE pipe);
     void HandleLaunch(HANDLE pipe, const std::vector<std::byte>& payload, LaunchResult& result);
+    void HandleAllowAdd(HANDLE pipe, const std::vector<std::byte>& payload, OperationResult& result);
+    void HandleAllowRemove(HANDLE pipe, const std::vector<std::byte>& payload, OperationResult& result);
+    void HandleAllowList(HANDLE pipe);
 
     UniqueHandle stopEvent_;
     std::thread thread_;

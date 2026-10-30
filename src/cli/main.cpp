@@ -17,16 +17,6 @@ namespace {
 
 using uiauf::UniqueHandle;
 
-struct RegKeyCloser {
-    void operator()(HKEY key) const noexcept {
-        if (key != nullptr) {
-            RegCloseKey(key);
-        }
-    }
-};
-
-using UniqueRegKey = std::unique_ptr<HKEY__, RegKeyCloser>;
-
 void EnableUnicodeConsole() {
     SetConsoleOutputCP(CP_UTF8);
     _setmode(_fileno(stdout), _O_U8TEXT);
@@ -42,15 +32,17 @@ void PrintUsage() {
                   L"  uiauf check <PID>                          查看进程是否具有 UIAccess\n"
                   L"  uiauf ping                                 检查服务是否在线\n"
                   L"  uiauf allow list                           列出白名单\n"
-                  L"  uiauf allow add <文件> [--hash]            添加白名单条目（管理员）\n"
+                  L"  uiauf allow add <文件>                     注册白名单条目（管理员，自动锁定哈希）\n"
                   L"  uiauf allow remove <名称>                  删除白名单条目（管理员）\n"
                   L"  uiauf help                                 显示本帮助\n"
                   L"\n"
-                  L"白名单位于 HKLM\\SOFTWARE\\UIA-UF\\Allow\\<名称>：\n"
-                  L"  Path   (REG_SZ)       可执行文件完整路径\n"
-                  L"  Sha256 (REG_SZ, 可选) 允许的 SHA-256；缺省表示不校验哈希\n"
+                  L"白名单位于 HKLM\\SOFTWARE\\UIA-UF\\Allow\\<名称>，ACL 仅允许 SYSTEM 写入，\n"
+                  L"因此所有修改都通过服务完成，需要服务在线且当前终端已提权：\n"
+                  L"  Path   (REG_SZ)       可执行文件最终路径\n"
+                  L"  Sha256 (REG_SZ)       强制项，必须与文件内容一致\n"
                   L"\n"
-                  L"add 默认使用文件名（不含扩展名）作为条目名称，--hash 同时锁定文件哈希。\n");
+                  L"条目名称取文件名（不含扩展名）。注册时会同时提交预期哈希，服务端重新计算并比对，\n"
+                  L"不一致则拒绝写入。--hash 参数保留兼容，现已默认启用。\n");
 }
 
 std::wstring ToFullPath(const std::wstring& path) {
@@ -62,14 +54,16 @@ std::wstring ToFullPath(const std::wstring& path) {
     return std::wstring(buffer.data(), length);
 }
 
-std::wstring BaseNameWithoutExtension(const std::wstring& path) {
-    const size_t separator = path.find_last_of(L"\\/");
-    std::wstring name = separator == std::wstring::npos ? path : path.substr(separator + 1);
-    const size_t dot = name.find_last_of(L'.');
-    if (dot != std::wstring::npos && dot > 0) {
-        name.resize(dot);
+// Stores the dereferenced path, which is what the service compares against.
+std::wstring ResolveFinalPath(const std::wstring& path) {
+    UniqueHandle file(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE) {
+        return path;
     }
-    return name.empty() ? L"app" : name;
+    const std::wstring finalPath = uiauf::FinalPathOf(file.get());
+    return finalPath.empty() ? path : finalPath;
 }
 
 bool ReadFileSha256(const std::wstring& path, std::wstring& digest, DWORD& error) {
@@ -269,97 +263,108 @@ int PingCommand() {
     return 0;
 }
 
-int AllowListCommand() {
-    HKEY rawKey = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, uiauf::kRegistryAllowKey, 0, KEY_READ | KEY_WOW64_64KEY, &rawKey) !=
-        ERROR_SUCCESS) {
-        std::wprintf(L"白名单为空（尚未创建 %ls）。\n", uiauf::kRegistryAllowKey);
-        return 0;
-    }
-    UniqueRegKey key(rawKey);
-
-    std::wprintf(L"%-28ls %-64ls %ls\n", L"名称", L"路径", L"SHA-256");
-    int count = 0;
-    for (DWORD index = 0;; ++index) {
-        wchar_t name[256]{};
-        DWORD nameLength = static_cast<DWORD>(std::size(name));
-        if (RegEnumKeyExW(key.get(), index, name, &nameLength, nullptr, nullptr, nullptr, nullptr) !=
-            ERROR_SUCCESS) {
-            break;
-        }
-
-        wchar_t value[32768]{};
-        DWORD bytes = sizeof(value);
-        DWORD type = 0;
-        const LSTATUS status = RegGetValueW(key.get(), name, L"Path", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
-                                            &type, value, &bytes);
-
-        wchar_t hash[80]{};
-        DWORD hashBytes = sizeof(hash);
-        RegGetValueW(key.get(), name, L"Sha256", RRF_RT_REG_SZ, nullptr, hash, &hashBytes);
-
-        std::wprintf(L"%-28ls %-64ls %ls\n", name,
-                     status == ERROR_SUCCESS ? value : L"<缺少 Path>",
-                     hash[0] != L'\0' ? hash : L"(不校验)");
-        ++count;
+int SendAllowRequest(const wchar_t* label, uiauf::MessageType requestType,
+                     const std::vector<std::byte>& payload) {
+    DWORD error = ERROR_SUCCESS;
+    UniqueHandle pipe = ConnectToService(error);
+    if (!pipe) {
+        return ReportServiceUnavailable(error);
     }
 
-    std::wprintf(L"\n共 %d 个条目。\n", count);
+    error = uiauf::SendMessage(pipe.get(), requestType, payload.data(), static_cast<uint32_t>(payload.size()));
+    if (error != ERROR_SUCCESS) {
+        std::fwprintf(stderr, L"发送请求失败: %ls\n", uiauf::FormatWin32Error(error).c_str());
+        return 1;
+    }
+
+    uiauf::MessageType type = uiauf::MessageType::AllowResult;
+    std::vector<std::byte> response;
+    error = uiauf::ReceiveMessage(pipe.get(), type, response);
+    if (error != ERROR_SUCCESS || type != uiauf::MessageType::AllowResult ||
+        response.size() != sizeof(uiauf::OperationResult)) {
+        std::fwprintf(stderr, L"服务返回了无法识别的响应。\n");
+        return 1;
+    }
+
+    uiauf::OperationResult result{};
+    std::memcpy(&result, response.data(), sizeof(result));
+    if (result.status != ERROR_SUCCESS) {
+        std::fwprintf(stderr, L"%ls失败 (%ls): %ls\n", label, uiauf::FormatWin32Error(result.status).c_str(),
+                      result.message);
+        return 1;
+    }
+
+    std::wprintf(L"%ls\n", result.message);
     return 0;
 }
 
-int AllowAddCommand(const std::vector<std::wstring>& positional, bool pinHash) {
+int AllowListCommand() {
+    DWORD error = ERROR_SUCCESS;
+    UniqueHandle pipe = ConnectToService(error);
+    if (!pipe) {
+        return ReportServiceUnavailable(error);
+    }
+
+    error = uiauf::SendMessage(pipe.get(), uiauf::MessageType::AllowList, nullptr, 0);
+    if (error != ERROR_SUCCESS) {
+        std::fwprintf(stderr, L"发送请求失败: %ls\n", uiauf::FormatWin32Error(error).c_str());
+        return 1;
+    }
+
+    uiauf::MessageType type = uiauf::MessageType::AllowListResult;
+    std::vector<std::byte> response;
+    error = uiauf::ReceiveMessage(pipe.get(), type, response);
+    if (error != ERROR_SUCCESS || type != uiauf::MessageType::AllowListResult) {
+        std::fwprintf(stderr, L"服务返回了无法识别的响应。\n");
+        return 1;
+    }
+
+    std::vector<std::wstring> parts;
+    if (!uiauf::ParseStringPayload(response.data(), response.size(), parts) || parts.size() % 3 != 0) {
+        std::fwprintf(stderr, L"白名单响应格式错误。\n");
+        return 1;
+    }
+
+    if (parts.empty()) {
+        std::wprintf(L"白名单为空。\n");
+        return 0;
+    }
+
+    std::wprintf(L"%-24ls %-64ls %ls\n", L"名称", L"路径", L"SHA-256");
+    for (size_t index = 0; index + 2 < parts.size(); index += 3) {
+        std::wprintf(L"%-24ls %-64ls %ls\n", parts[index].c_str(), parts[index + 1].c_str(),
+                     parts[index + 2].empty() ? L"(缺失，已失效)" : parts[index + 2].c_str());
+    }
+    std::wprintf(L"\n共 %zu 个条目。\n", parts.size() / 3);
+    return 0;
+}
+
+int AllowAddCommand(const std::vector<std::wstring>& positional) {
     if (positional.size() < 3) {
         std::fwprintf(stderr, L"allow add: 缺少文件路径。\n");
         return 2;
     }
     if (!uiauf::IsElevated()) {
-        std::fwprintf(stderr, L"allow add: 需要管理员权限。\n");
+        std::fwprintf(stderr, L"allow add: 需要在管理员终端中运行。\n");
         return 5;
     }
 
-    const std::wstring path = ToFullPath(positional[2]);
+    const std::wstring path = ResolveFinalPath(ToFullPath(positional[2]));
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         std::fwprintf(stderr, L"找不到文件: %ls\n", path.c_str());
         return 2;
     }
 
     std::wstring digest;
-    if (pinHash) {
-        DWORD error = ERROR_SUCCESS;
-        if (!ReadFileSha256(path, digest, error)) {
-            std::fwprintf(stderr, L"计算 SHA-256 失败: %ls\n", uiauf::FormatWin32Error(error).c_str());
-            return 1;
-        }
-    }
-
-    const std::wstring name = BaseNameWithoutExtension(path);
-    const std::wstring subKey = std::wstring(uiauf::kRegistryAllowKey) + L"\\" + name;
-
-    LSTATUS status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, subKey.c_str(), L"Path", REG_SZ, path.c_str(),
-                                     static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t)));
-    if (status != ERROR_SUCCESS) {
-        std::fwprintf(stderr, L"写入 Path 失败: %ls\n", uiauf::FormatWin32Error(status).c_str());
+    DWORD error = ERROR_SUCCESS;
+    if (!ReadFileSha256(path, digest, error)) {
+        std::fwprintf(stderr, L"计算 SHA-256 失败: %ls\n", uiauf::FormatWin32Error(error).c_str());
         return 1;
     }
 
-    if (pinHash) {
-        status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, subKey.c_str(), L"Sha256", REG_SZ, digest.c_str(),
-                                 static_cast<DWORD>((digest.size() + 1) * sizeof(wchar_t)));
-        if (status != ERROR_SUCCESS) {
-            std::fwprintf(stderr, L"写入 Sha256 失败: %ls\n", uiauf::FormatWin32Error(status).c_str());
-            return 1;
-        }
-    } else {
-        RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, subKey.c_str(), L"Sha256");
-    }
-
-    std::wprintf(L"已添加白名单条目 [%ls]\n  Path   = %ls\n", name.c_str(), path.c_str());
-    if (pinHash) {
-        std::wprintf(L"  Sha256 = %ls\n", digest.c_str());
-        std::wprintf(L"注意：目标文件更新后哈希会失配，需要重新执行本命令。\n");
-    }
-    return 0;
+    std::wprintf(L"注册 %ls\n  预期 SHA-256 = %ls\n", path.c_str(), digest.c_str());
+    return SendAllowRequest(L"注册白名单条目", uiauf::MessageType::AllowAdd,
+                            uiauf::MakeStringPayload({path, digest}));
 }
 
 int AllowRemoveCommand(const std::vector<std::wstring>& positional) {
@@ -368,19 +373,12 @@ int AllowRemoveCommand(const std::vector<std::wstring>& positional) {
         return 2;
     }
     if (!uiauf::IsElevated()) {
-        std::fwprintf(stderr, L"allow remove: 需要管理员权限。\n");
+        std::fwprintf(stderr, L"allow remove: 需要在管理员终端中运行。\n");
         return 5;
     }
 
-    const std::wstring subKey = std::wstring(uiauf::kRegistryAllowKey) + L"\\" + positional[2];
-    const LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, subKey.c_str());
-    if (status != ERROR_SUCCESS) {
-        std::fwprintf(stderr, L"删除失败: %ls\n", uiauf::FormatWin32Error(status).c_str());
-        return 1;
-    }
-
-    std::wprintf(L"已删除白名单条目 [%ls]\n", positional[2].c_str());
-    return 0;
+    return SendAllowRequest(L"删除白名单条目", uiauf::MessageType::AllowRemove,
+                            uiauf::MakeStringPayload({positional[2]}));
 }
 
 } // namespace
@@ -396,7 +394,6 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring_view command = argv[1];
     std::vector<std::wstring> positional;
     bool waitForExit = false;
-    bool pinHash = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--wait") == 0) {
@@ -404,7 +401,7 @@ int wmain(int argc, wchar_t** argv) {
             continue;
         }
         if (std::wcscmp(argv[i], L"--hash") == 0) {
-            pinHash = true;
+            // Kept for compatibility: hashing is mandatory now.
             continue;
         }
         positional.emplace_back(argv[i]);
@@ -428,7 +425,7 @@ int wmain(int argc, wchar_t** argv) {
             return AllowListCommand();
         }
         if (positional[1] == L"add") {
-            return AllowAddCommand(positional, pinHash);
+            return AllowAddCommand(positional);
         }
         if (positional[1] == L"remove" || positional[1] == L"delete") {
             return AllowRemoveCommand(positional);

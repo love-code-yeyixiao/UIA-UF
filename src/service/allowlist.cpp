@@ -1,5 +1,7 @@
 #include "service/allowlist.h"
 
+#include <aclapi.h>
+#include <sddl.h>
 
 #include <iterator>
 #include <string>
@@ -13,10 +15,10 @@
 namespace uiauf {
 namespace {
 
-struct AllowEntry {
-    std::wstring path;
-    std::wstring sha256;
-};
+// SYSTEM full control, administrators read-only. The DACL is protected (no
+// inheritance) and the key owner is SYSTEM, so an administrator cannot rewrite
+// the DACL without taking ownership first.
+constexpr wchar_t kAllowListSddl[] = L"D:P(A;CI;KA;;;SY)(A;CI;KR;;;BA)";
 
 struct RegKeyCloser {
     void operator()(HKEY key) const noexcept {
@@ -27,6 +29,12 @@ struct RegKeyCloser {
 };
 
 using UniqueRegKey = std::unique_ptr<HKEY__, RegKeyCloser>;
+
+struct AllowEntry {
+    std::wstring name;
+    std::wstring path;
+    std::wstring sha256;
+};
 
 constexpr DWORD kMaxPathChars = 32768;
 
@@ -49,75 +57,14 @@ DWORD NormalizePath(const std::wstring& input, std::wstring& output) {
     return ERROR_SUCCESS;
 }
 
-// Strips the \\?\ prefix that GetFinalPathNameByHandleW returns.
-std::wstring StripNtPrefix(std::wstring path) {
-    if (path.rfind(L"\\\\?\\UNC\\", 0) == 0) {
-        return L"\\\\" + path.substr(8);
+std::wstring BaseNameOf(const std::wstring& path) {
+    const size_t separator = path.find_last_of(L"\\/");
+    std::wstring name = separator == std::wstring::npos ? path : path.substr(separator + 1);
+    const size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot > 0) {
+        name.resize(dot);
     }
-    if (path.rfind(L"\\\\?\\", 0) == 0) {
-        return path.substr(4);
-    }
-    return path;
-}
-
-
-std::vector<AllowEntry> LoadAllowList() {
-    std::vector<AllowEntry> entries;
-
-    HKEY rawKey = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRegistryAllowKey, 0, KEY_READ | KEY_WOW64_64KEY, &rawKey) !=
-        ERROR_SUCCESS) {
-        return entries;
-    }
-    UniqueRegKey key(rawKey);
-
-    for (DWORD index = 0;; ++index) {
-        wchar_t subKeyName[256]{};
-        DWORD nameLength = static_cast<DWORD>(std::size(subKeyName));
-        const LSTATUS status =
-            RegEnumKeyExW(static_cast<HKEY>(key.get()), index, subKeyName, &nameLength, nullptr, nullptr,
-                          nullptr, nullptr);
-        if (status == ERROR_NO_MORE_ITEMS) {
-            break;
-        }
-        if (status != ERROR_SUCCESS) {
-            break;
-        }
-
-        HKEY rawSubKey = nullptr;
-        if (RegOpenKeyExW(static_cast<HKEY>(key.get()), subKeyName, 0, KEY_READ | KEY_WOW64_64KEY,
-                          &rawSubKey) != ERROR_SUCCESS) {
-            continue;
-        }
-        UniqueRegKey subKey(rawSubKey);
-
-        auto readString = [&subKey](const wchar_t* valueName) -> std::wstring {
-            DWORD type = 0;
-            DWORD bytes = 0;
-            if (RegGetValueW(static_cast<HKEY>(subKey.get()), nullptr, valueName,
-                             RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type, nullptr, &bytes) != ERROR_SUCCESS ||
-                bytes == 0) {
-                return {};
-            }
-
-            std::vector<wchar_t> buffer(bytes / sizeof(wchar_t) + 1);
-            if (RegGetValueW(static_cast<HKEY>(subKey.get()), nullptr, valueName,
-                             RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type, buffer.data(), &bytes) !=
-                ERROR_SUCCESS) {
-                return {};
-            }
-            return std::wstring(buffer.data());
-        };
-
-        AllowEntry entry;
-        entry.path = readString(L"Path");
-        entry.sha256 = readString(L"Sha256");
-        if (!entry.path.empty()) {
-            entries.push_back(std::move(entry));
-        }
-    }
-
-    return entries;
+    return name;
 }
 
 bool IsSha256(const std::wstring& text) {
@@ -134,13 +81,74 @@ bool IsSha256(const std::wstring& text) {
     return true;
 }
 
-} // namespace
+std::wstring ReadStringValue(HKEY key, const wchar_t* valueName) {
+    DWORD type = 0;
+    DWORD bytes = 0;
+    if (RegGetValueW(key, nullptr, valueName, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type, nullptr, &bytes) !=
+            ERROR_SUCCESS ||
+        bytes == 0) {
+        return {};
+    }
 
-DWORD ResolveAllowedExecutable(const std::wstring& requested, std::wstring& resolvedPath,
-                               std::wstring& reason) {
-    resolvedPath.clear();
-    reason.clear();
+    std::vector<wchar_t> buffer(bytes / sizeof(wchar_t) + 1);
+    if (RegGetValueW(key, nullptr, valueName, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type, buffer.data(),
+                     &bytes) != ERROR_SUCCESS) {
+        return {};
+    }
+    return std::wstring(buffer.data());
+}
 
+std::vector<AllowEntry> LoadAllowList() {
+    std::vector<AllowEntry> entries;
+
+    HKEY rawKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRegistryAllowKey, 0, KEY_READ | KEY_WOW64_64KEY, &rawKey) !=
+        ERROR_SUCCESS) {
+        return entries;
+    }
+    UniqueRegKey key(rawKey);
+
+    for (DWORD index = 0;; ++index) {
+        wchar_t name[256]{};
+        DWORD nameLength = static_cast<DWORD>(std::size(name));
+        const LSTATUS status =
+            RegEnumKeyExW(key.get(), index, name, &nameLength, nullptr, nullptr, nullptr, nullptr);
+        if (status == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (status != ERROR_SUCCESS) {
+            break;
+        }
+
+        HKEY rawSubKey = nullptr;
+        if (RegOpenKeyExW(key.get(), name, 0, KEY_READ | KEY_WOW64_64KEY, &rawSubKey) != ERROR_SUCCESS) {
+            continue;
+        }
+        UniqueRegKey subKey(rawSubKey);
+
+        AllowEntry entry;
+        entry.name = name;
+        entry.path = ReadStringValue(subKey.get(), L"Path");
+        entry.sha256 = ReadStringValue(subKey.get(), L"Sha256");
+        if (!entry.path.empty()) {
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    return entries;
+}
+
+// An executable opened for validation. The handle denies writes and deletes, so
+// the bytes cannot be swapped while it is alive.
+struct OpenedImage {
+    UniqueHandle file;
+    std::wstring path;
+    std::wstring digest;
+    ImageIdentity identity;
+};
+
+DWORD OpenImage(const std::wstring& requested, OpenedImage& opened, std::wstring& reason) {
+    opened = OpenedImage{};
     if (requested.empty()) {
         reason = L"请求为空。";
         return ERROR_INVALID_PARAMETER;
@@ -153,24 +161,20 @@ DWORD ResolveAllowedExecutable(const std::wstring& requested, std::wstring& reso
         return error;
     }
 
-    UniqueHandle file(CreateFileW(absolutePath.c_str(), GENERIC_READ,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    UniqueHandle file(CreateFileW(absolutePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr));
     if (file.get() == INVALID_HANDLE_VALUE) {
         error = GetLastError();
         reason = L"无法打开目标可执行文件" + FormatWin32Error(error);
         return error;
     }
 
-    wchar_t finalPathBuffer[kMaxPathChars]{};
-    const DWORD finalLength =
-        GetFinalPathNameByHandleW(file.get(), finalPathBuffer, kMaxPathChars, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    if (finalLength == 0 || finalLength >= kMaxPathChars) {
-        error = finalLength == 0 ? GetLastError() : ERROR_BUFFER_OVERFLOW;
+    const std::wstring finalPath = FinalPathOf(file.get());
+    if (finalPath.empty()) {
+        error = GetLastError();
         reason = L"无法解析最终路径" + FormatWin32Error(error);
         return error;
     }
-    resolvedPath = StripNtPrefix(std::wstring(finalPathBuffer, finalLength));
 
     std::wstring digest;
     error = ComputeSha256Hex(file.get(), digest);
@@ -179,7 +183,6 @@ DWORD ResolveAllowedExecutable(const std::wstring& requested, std::wstring& reso
         return error;
     }
 
-    // Reject directories masquerading as executables.
     BY_HANDLE_FILE_INFORMATION info{};
     if (!GetFileInformationByHandle(file.get(), &info)) {
         error = GetLastError();
@@ -191,9 +194,110 @@ DWORD ResolveAllowedExecutable(const std::wstring& requested, std::wstring& reso
         return ERROR_ACCESS_DENIED;
     }
 
+    ImageIdentity identity{};
+    if (!IdentityFromHandle(file.get(), identity)) {
+        error = GetLastError();
+        reason = L"无法读取文件标识" + FormatWin32Error(error);
+        return error;
+    }
+
+    opened.file = std::move(file);
+    opened.path = finalPath;
+    opened.digest = std::move(digest);
+    opened.identity = identity;
+    return ERROR_SUCCESS;
+}
+
+} // namespace
+
+DWORD EnsureAllowListKey(std::wstring& message) {
+    message.clear();
+
+    HANDLE rawToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &rawToken)) {
+        const DWORD error = GetLastError();
+        message = L"无法打开进程令牌" + FormatWin32Error(error);
+        return error;
+    }
+    UniqueHandle processToken(rawToken);
+
+    // Needed to set the owner of an existing key to SYSTEM.
+    EnablePrivilege(processToken.get(), SE_RESTORE_NAME);
+
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(kAllowListSddl, SDDL_REVISION_1, &descriptor,
+                                                             nullptr)) {
+        const DWORD error = GetLastError();
+        message = L"构建安全描述符失败" + FormatWin32Error(error);
+        return error;
+    }
+
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
+    PSID systemSid = nullptr;
+    if (!AllocateAndInitializeSid(&authority, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &systemSid)) {
+        const DWORD error = GetLastError();
+        LocalFree(descriptor);
+        message = L"构建 SYSTEM SID 失败" + FormatWin32Error(error);
+        return error;
+    }
+
+    PACL dacl = nullptr;
+    BOOL present = FALSE;
+    BOOL defaulted = FALSE;
+    GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted);
+
+    DWORD result = ERROR_SUCCESS;
+    for (const wchar_t* path : {L"SOFTWARE\\UIA-UF", kRegistryAllowKey}) {
+        SECURITY_ATTRIBUTES attributes{};
+        attributes.nLength = sizeof(attributes);
+        attributes.lpSecurityDescriptor = descriptor;
+
+        HKEY rawKey = nullptr;
+        const LSTATUS status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, nullptr, REG_OPTION_NON_VOLATILE,
+                                               WRITE_OWNER | WRITE_DAC | KEY_READ, &attributes, &rawKey, nullptr);
+        if (status != ERROR_SUCCESS) {
+            result = status;
+            message = L"无法打开注册表项 " + std::wstring(path) + FormatWin32Error(status);
+            break;
+        }
+        UniqueRegKey key(rawKey);
+
+        const DWORD securityStatus =
+            SetSecurityInfo(key.get(), SE_REGISTRY_KEY,
+                            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                                PROTECTED_DACL_SECURITY_INFORMATION,
+                            nullptr, systemSid, dacl, nullptr);
+        if (securityStatus != ERROR_SUCCESS) {
+            result = securityStatus;
+            message = L"无法收紧注册表项 " + std::wstring(path) + FormatWin32Error(securityStatus);
+            break;
+        }
+    }
+
+    FreeSid(systemSid);
+    LocalFree(descriptor);
+
+    if (result == ERROR_SUCCESS) {
+        LogLine(L"白名单注册表项已限制为仅 SYSTEM 可写。");
+    } else {
+        LogLine(L"收紧白名单注册表项失败：" + message);
+    }
+    return result;
+}
+
+DWORD ResolveAllowedExecutable(const std::wstring& requested, VerifiedImage& image, std::wstring& reason) {
+    image = VerifiedImage{};
+    reason.clear();
+
+    OpenedImage opened;
+    DWORD error = OpenImage(requested, opened, reason);
+    if (error != ERROR_SUCCESS) {
+        return error;
+    }
+
     const std::vector<AllowEntry> entries = LoadAllowList();
     if (entries.empty()) {
-        reason = L"白名单为空（HKLM\\SOFTWARE\\UIA-UF\\Allow）。请先由管理员添加条目。";
+        reason = L"白名单为空（HKLM\\SOFTWARE\\UIA-UF\\Allow）。请先由管理员注册。";
         return ERROR_ACCESS_DENIED;
     }
 
@@ -202,19 +306,117 @@ DWORD ResolveAllowedExecutable(const std::wstring& requested, std::wstring& reso
         if (NormalizePath(entry.path, entryPath) != ERROR_SUCCESS) {
             continue;
         }
-        if (!EqualsIgnoreCase(entryPath, resolvedPath)) {
+        if (!EqualsIgnoreCase(entryPath, opened.path)) {
             continue;
         }
-        if (IsSha256(entry.sha256) && !EqualsIgnoreCase(entry.sha256, digest)) {
-            reason = L"白名单条目存在，但文件哈希不匹配（可能已更新或已被替换）。";
-            LogLine(L"allowlist hash mismatch for " + resolvedPath);
+
+        // Hash pinning is mandatory: an entry without a usable Sha256 authorises
+        // nothing.
+        if (!IsSha256(entry.sha256)) {
+            reason = L"条目 [" + entry.name + L"] 缺少有效的 Sha256，已按未授权处理。";
+            LogLine(L"allowlist entry without valid hash: " + entry.name);
             return ERROR_ACCESS_DENIED;
         }
+        if (!EqualsIgnoreCase(entry.sha256, opened.digest)) {
+            reason = L"条目 [" + entry.name + L"] 的哈希与文件不匹配（可能已更新或被替换）。";
+            LogLine(L"allowlist hash mismatch for " + opened.path);
+            return ERROR_ACCESS_DENIED;
+        }
+
+        image.file = std::move(opened.file);
+        image.path = opened.path;
+        image.identity = opened.identity;
         return ERROR_SUCCESS;
     }
 
-    reason = L"目标不在白名单中：" + resolvedPath;
+    reason = L"目标不在白名单中：" + opened.path;
     return ERROR_ACCESS_DENIED;
+}
+
+DWORD AddAllowEntry(const std::wstring& requested, const std::wstring& expectedSha256, std::wstring& message) {
+    message.clear();
+
+    if (!IsSha256(expectedSha256)) {
+        message = L"注册时必须提供 64 位十六进制的 SHA-256。";
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    std::wstring reason;
+    OpenedImage opened;
+    DWORD error = OpenImage(requested, opened, reason);
+    if (error != ERROR_SUCCESS) {
+        message = reason;
+        return error;
+    }
+
+    if (!EqualsIgnoreCase(opened.digest, expectedSha256)) {
+        message = L"调用者提供的预期哈希与文件实际内容不一致，未写入。\n  预期 = " + expectedSha256 +
+                  L"\n  实际 = " + opened.digest;
+        LogLine(L"allowlist add rejected, hash mismatch for " + opened.path);
+        return ERROR_INVALID_DATA;
+    }
+
+    std::wstring keyMessage;
+    error = EnsureAllowListKey(keyMessage);
+    if (error != ERROR_SUCCESS) {
+        message = L"无法准备白名单注册表项：" + keyMessage;
+        return error;
+    }
+
+    const std::wstring name = BaseNameOf(opened.path);
+    const std::wstring subKey = std::wstring(kRegistryAllowKey) + L"\\" + name;
+
+    LSTATUS status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, subKey.c_str(), L"Path", REG_SZ, opened.path.c_str(),
+                                     static_cast<DWORD>((opened.path.size() + 1) * sizeof(wchar_t)));
+    if (status != ERROR_SUCCESS) {
+        message = L"写入 Path 失败" + FormatWin32Error(status);
+        return status;
+    }
+
+    status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, subKey.c_str(), L"Sha256", REG_SZ, opened.digest.c_str(),
+                             static_cast<DWORD>((opened.digest.size() + 1) * sizeof(wchar_t)));
+    if (status != ERROR_SUCCESS) {
+        message = L"写入 Sha256 失败" + FormatWin32Error(status);
+        return status;
+    }
+
+    message = L"已注册 [" + name + L"]\n  Path   = " + opened.path + L"\n  Sha256 = " + opened.digest;
+    LogLine(L"allowlist entry added: " + name + L" -> " + opened.path);
+    return ERROR_SUCCESS;
+}
+
+DWORD RemoveAllowEntry(const std::wstring& name, std::wstring& message) {
+    message.clear();
+
+    if (name.empty() || name.find_first_of(L"\\/") != std::wstring::npos) {
+        message = L"条目名称非法。";
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    const std::wstring subKey = std::wstring(kRegistryAllowKey) + L"\\" + name;
+    const LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, subKey.c_str());
+    if (status != ERROR_SUCCESS) {
+        message = L"删除失败" + FormatWin32Error(status);
+        return status;
+    }
+
+    message = L"已删除 [" + name + L"]";
+    LogLine(L"allowlist entry removed: " + name);
+    return ERROR_SUCCESS;
+}
+
+DWORD ListAllowEntries(std::vector<AllowEntryInfo>& entries, std::wstring& message) {
+    entries.clear();
+    message.clear();
+
+    for (const AllowEntry& entry : LoadAllowList()) {
+        AllowEntryInfo info;
+        info.name = entry.name;
+        info.path = entry.path;
+        info.sha256 = entry.sha256;
+        entries.push_back(std::move(info));
+    }
+    return ERROR_SUCCESS;
 }
 
 } // namespace uiauf

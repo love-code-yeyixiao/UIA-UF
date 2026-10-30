@@ -26,14 +26,21 @@ inline constexpr wchar_t kServiceDescription[] =
 inline constexpr wchar_t kRegistryAllowKey[] = L"SOFTWARE\\UIA-UF\\Allow";
 
 inline constexpr uint32_t kProtocolMagic = 0x46414955u; // 'U','I','A','F'
-inline constexpr uint16_t kProtocolVersion = 1;
+inline constexpr uint16_t kProtocolVersion = 2;
 inline constexpr uint32_t kMaxPayloadBytes = 64u * 1024u;
 
+// Allow list administration lives in a key whose DACL only grants write access
+// to SYSTEM, so it has to go through the service.
 enum class MessageType : uint16_t {
     Ping = 1,
     Pong = 2,
     Launch = 3,
     LaunchResult = 4,
+    AllowAdd = 5,
+    AllowRemove = 6,
+    AllowList = 7,
+    AllowResult = 8,
+    AllowListResult = 9,
 };
 
 #pragma warning(push)
@@ -58,6 +65,12 @@ struct PingResult {
 struct LaunchResult {
     uint32_t status;
     uint32_t childPid;
+    wchar_t message[256];
+};
+
+struct OperationResult {
+    uint32_t status;
+    uint32_t reserved;
     wchar_t message[256];
 };
 
@@ -106,6 +119,50 @@ inline bool ParseLaunchPayload(const std::byte* data, size_t size, std::wstring&
     const size_t argsLength = count - argsStart - 1;
     exe.assign(text, exeLength);
     args.assign(text + argsStart, argsLength);
+    return true;
+}
+
+// Generic NUL separated UTF-16 payload, used by the allow list messages.
+inline std::vector<std::byte> MakeStringPayload(std::initializer_list<std::wstring_view> parts) {
+    size_t chars = 0;
+    for (const auto part : parts) {
+        chars += part.size() + 1;
+    }
+
+    std::vector<std::byte> payload(chars * sizeof(wchar_t));
+    wchar_t* cursor = reinterpret_cast<wchar_t*>(payload.data());
+    for (const auto part : parts) {
+        if (!part.empty()) {
+            std::memcpy(cursor, part.data(), part.size() * sizeof(wchar_t));
+        }
+        cursor += part.size();
+        *cursor++ = L'\0';
+    }
+    return payload;
+}
+
+inline bool ParseStringPayload(const std::byte* data, size_t size, std::vector<std::wstring>& parts) {
+    parts.clear();
+    if (size == 0) {
+        return true;
+    }
+    if (size % sizeof(wchar_t) != 0) {
+        return false;
+    }
+
+    const wchar_t* text = reinterpret_cast<const wchar_t*>(data);
+    const size_t count = size / sizeof(wchar_t);
+    if (text[count - 1] != L'\0') {
+        return false;
+    }
+
+    size_t start = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (text[i] == L'\0') {
+            parts.emplace_back(text + start, i - start);
+            start = i + 1;
+        }
+    }
     return true;
 }
 

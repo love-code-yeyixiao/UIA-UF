@@ -9,24 +9,6 @@
 
 namespace uiauf {
 
-DWORD EnablePrivilege(HANDLE token, const wchar_t* privilegeName) {
-    LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, privilegeName, &luid)) {
-        return GetLastError();
-    }
-
-    TOKEN_PRIVILEGES privileges{};
-    privileges.PrivilegeCount = 1;
-    privileges.Privileges[0].Luid = luid;
-    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    if (!AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr)) {
-        return GetLastError();
-    }
-    // AdjustTokenPrivileges reports success even when nothing was enabled.
-    return GetLastError();
-}
-
 DWORD DuplicateClientPrimaryToken(UniqueHandle& token, std::wstring& callerName) {
     callerName.clear();
 
@@ -64,10 +46,44 @@ DWORD DuplicateClientPrimaryToken(UniqueHandle& token, std::wstring& callerName)
     return ERROR_SUCCESS;
 }
 
-DWORD LaunchWithUIAccess(HANDLE primaryToken, const std::wstring& executable, const std::wstring& arguments,
+namespace {
+
+// The image section already exists once CreateProcess returns, so checking the
+// identity before ResumeThread guarantees that user code never runs from a
+// swapped image, even if a parent directory gets replaced afterwards.
+DWORD VerifySuspendedImage(HANDLE process, const ImageIdentity& expected, std::wstring& errorText) {
+    std::vector<wchar_t> path(32768);
+    DWORD length = static_cast<DWORD>(path.size());
+    if (!QueryFullProcessImageNameW(process, 0, path.data(), &length)) {
+        const DWORD error = GetLastError();
+        errorText = L"无法读取新进程映像路径" + FormatWin32Error(error);
+        return error;
+    }
+
+    ImageIdentity actual{};
+    if (!IdentityFromPath(std::wstring(path.data(), length), actual)) {
+        const DWORD error = GetLastError();
+        errorText = L"无法校验新进程映像" + FormatWin32Error(error);
+        return error != ERROR_SUCCESS ? error : ERROR_FILE_NOT_FOUND;
+    }
+
+    if (!(actual == expected)) {
+        errorText = L"目标文件在验证后、启动前被替换，已终止进程。";
+        return ERROR_ACCESS_DENIED;
+    }
+    return ERROR_SUCCESS;
+}
+
+} // namespace
+
+DWORD LaunchWithUIAccess(HANDLE primaryToken, const VerifiedImage& image, const std::wstring& arguments,
                          DWORD& childPid, std::wstring& errorText) {
     childPid = 0;
     errorText.clear();
+
+    // image.file keeps the bytes pinned (share mode denies write/delete) for
+    // the whole duration of this call.
+    const std::wstring& executable = image.path;
 
     HANDLE rawProcessToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &rawProcessToken)) {
@@ -110,9 +126,11 @@ DWORD LaunchWithUIAccess(HANDLE primaryToken, const std::wstring& executable, co
     const bool hasEnvironment = CreateEnvironmentBlock(&environment, primaryToken, FALSE) != FALSE;
 
     PROCESS_INFORMATION child{};
-    const BOOL created = CreateProcessAsUserW(
-        primaryToken, executable.c_str(), commandLine.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT,
-        environment, workingDirectory.empty() ? nullptr : workingDirectory.c_str(), &startup, &child);
+    const BOOL created = CreateProcessAsUserW(primaryToken, executable.c_str(), commandLine.data(), nullptr,
+                                              nullptr, FALSE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                                              environment,
+                                              workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
+                                              &startup, &child);
 
     if (hasEnvironment) {
         DestroyEnvironmentBlock(environment);
@@ -121,6 +139,23 @@ DWORD LaunchWithUIAccess(HANDLE primaryToken, const std::wstring& executable, co
     if (!created) {
         const DWORD error = GetLastError();
         errorText = L"CreateProcessAsUser 失败" + FormatWin32Error(error);
+        return error;
+    }
+
+    DWORD error = VerifySuspendedImage(child.hProcess, image.identity, errorText);
+    if (error != ERROR_SUCCESS) {
+        TerminateProcess(child.hProcess, static_cast<UINT>(-1));
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+        return error;
+    }
+
+    if (ResumeThread(child.hThread) == static_cast<DWORD>(-1)) {
+        error = GetLastError();
+        TerminateProcess(child.hProcess, static_cast<UINT>(-1));
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+        errorText = L"ResumeThread 失败" + FormatWin32Error(error);
         return error;
     }
 

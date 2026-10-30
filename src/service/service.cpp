@@ -5,6 +5,7 @@
 
 #include "common/protocol.h"
 #include "common/win32_helpers.h"
+#include "service/allowlist.h"
 #include "service/log.h"
 #include "service/server.h"
 
@@ -95,6 +96,9 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv) {
 
     ReportStatus(SERVICE_START_PENDING, NO_ERROR, 5000);
     LogLine(L"服务正在启动。");
+
+    std::wstring keyMessage;
+    EnsureAllowListKey(keyMessage);
 
     ServiceServer server;
     g_server = &server;

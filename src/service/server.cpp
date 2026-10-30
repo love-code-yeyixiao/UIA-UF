@@ -41,6 +41,48 @@ void SetResultMessage(LaunchResult& result, const std::wstring& text) {
     wcsncpy_s(result.message, _countof(result.message), text.c_str(), _TRUNCATE);
 }
 
+void SetResultMessage(OperationResult& result, const std::wstring& text) {
+    wcsncpy_s(result.message, _countof(result.message), text.c_str(), _TRUNCATE);
+}
+
+// Checks that the caller's token is an elevated member of Administrators.
+bool IsElevatedAdministratorToken(HANDLE token, DWORD& error) {
+    DWORD returned = 0;
+    TOKEN_ELEVATION elevation{};
+    if (!GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &returned)) {
+        error = GetLastError();
+        return false;
+    }
+    if (!elevation.TokenIsElevated) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
+    PSID administrators = nullptr;
+    if (!AllocateAndInitializeSid(&authority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0,
+                                  0, 0, 0, &administrators)) {
+        error = GetLastError();
+        return false;
+    }
+
+    BOOL member = FALSE;
+    const BOOL checked = CheckTokenMembership(token, administrators, &member);
+    FreeSid(administrators);
+
+    if (!checked) {
+        error = GetLastError();
+        return false;
+    }
+    if (!member) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+
+    error = ERROR_SUCCESS;
+    return true;
+}
+
 } // namespace
 
 ServiceServer::~ServiceServer() {
@@ -163,6 +205,21 @@ void ServiceServer::HandleClient(HANDLE pipe) {
         SendMessage(pipe, MessageType::LaunchResult, &result, sizeof(result));
         break;
     }
+    case MessageType::AllowAdd: {
+        OperationResult result{};
+        HandleAllowAdd(pipe, payload, result);
+        SendMessage(pipe, MessageType::AllowResult, &result, sizeof(result));
+        break;
+    }
+    case MessageType::AllowRemove: {
+        OperationResult result{};
+        HandleAllowRemove(pipe, payload, result);
+        SendMessage(pipe, MessageType::AllowResult, &result, sizeof(result));
+        break;
+    }
+    case MessageType::AllowList:
+        HandleAllowList(pipe);
+        break;
     default:
         LogLine(L"收到未知消息类型 " + std::to_wstring(static_cast<int>(type)));
         break;
@@ -202,9 +259,9 @@ void ServiceServer::HandleLaunch(HANDLE pipe, const std::vector<std::byte>& payl
 
     impersonation.Revert();  // drop the client's identity before using our own privileges
 
-    std::wstring resolvedPath;
+    VerifiedImage image;
     std::wstring reason;
-    error = ResolveAllowedExecutable(executable, resolvedPath, reason);
+    error = ResolveAllowedExecutable(executable, image, reason);
     if (error != ERROR_SUCCESS) {
         result.status = error;
         SetResultMessage(result, reason);
@@ -214,17 +271,132 @@ void ServiceServer::HandleLaunch(HANDLE pipe, const std::vector<std::byte>& payl
 
     DWORD childPid = 0;
     std::wstring failure;
-    error = LaunchWithUIAccess(clientToken.get(), resolvedPath, arguments, childPid, failure);
+    error = LaunchWithUIAccess(clientToken.get(), image, arguments, childPid, failure);
     if (error != ERROR_SUCCESS) {
         result.status = error;
         SetResultMessage(result, failure);
-        LogLine(L"启动失败 [" + resolvedPath + L"]：" + failure);
+        LogLine(L"启动失败 [" + image.path + L"]：" + failure);
         return;
     }
 
     result.childPid = childPid;
-    LogLine(L"已为 " + caller + L" 以 UIAccess 启动 " + resolvedPath + L" (PID " +
+    LogLine(L"已为 " + caller + L" 以 UIAccess 启动 " + image.path + L" (PID " +
             std::to_wstring(childPid) + L")");
+}
+
+void ServiceServer::HandleAllowAdd(HANDLE pipe, const std::vector<std::byte>& payload,
+                                   OperationResult& result) {
+    result.status = ERROR_SUCCESS;
+    result.reserved = 0;
+    result.message[0] = L'\0';
+
+    if (!ImpersonateNamedPipeClient(pipe)) {
+        result.status = GetLastError();
+        SetResultMessage(result, L"ImpersonateNamedPipeClient 失败");
+        LogError(L"ImpersonateNamedPipeClient", result.status);
+        return;
+    }
+    ImpersonationScope impersonation(true);
+
+    UniqueHandle clientToken;
+    std::wstring caller;
+    DWORD error = DuplicateClientPrimaryToken(clientToken, caller);
+    impersonation.Revert();
+    if (error != ERROR_SUCCESS) {
+        result.status = error;
+        SetResultMessage(result, L"无法获取调用者令牌" + FormatWin32Error(error));
+        return;
+    }
+
+    if (!IsElevatedAdministratorToken(clientToken.get(), error)) {
+        result.status = error == ERROR_SUCCESS ? ERROR_ACCESS_DENIED : error;
+        SetResultMessage(result, L"修改白名单需要以管理员身份运行。");
+        LogLine(L"拒绝 " + caller + L" 的白名单注册请求。");
+        return;
+    }
+
+    std::vector<std::wstring> parts;
+    if (!ParseStringPayload(payload.data(), payload.size(), parts) || parts.size() != 2) {
+        result.status = ERROR_INVALID_DATA;
+        SetResultMessage(result, L"请求格式错误。");
+        return;
+    }
+
+    std::wstring message;
+    error = AddAllowEntry(parts[0], parts[1], message);
+    result.status = error;
+    SetResultMessage(result, message);
+
+    if (error == ERROR_SUCCESS) {
+        LogLine(L"管理员 " + caller + L" 注册了白名单条目：" + parts[0]);
+    }
+}
+
+void ServiceServer::HandleAllowRemove(HANDLE pipe, const std::vector<std::byte>& payload,
+                                      OperationResult& result) {
+    result.status = ERROR_SUCCESS;
+    result.reserved = 0;
+    result.message[0] = L'\0';
+
+    if (!ImpersonateNamedPipeClient(pipe)) {
+        result.status = GetLastError();
+        SetResultMessage(result, L"ImpersonateNamedPipeClient 失败");
+        LogError(L"ImpersonateNamedPipeClient", result.status);
+        return;
+    }
+    ImpersonationScope impersonation(true);
+
+    UniqueHandle clientToken;
+    std::wstring caller;
+    DWORD error = DuplicateClientPrimaryToken(clientToken, caller);
+    impersonation.Revert();
+    if (error != ERROR_SUCCESS) {
+        result.status = error;
+        SetResultMessage(result, L"无法获取调用者令牌" + FormatWin32Error(error));
+        return;
+    }
+
+    if (!IsElevatedAdministratorToken(clientToken.get(), error)) {
+        result.status = error == ERROR_SUCCESS ? ERROR_ACCESS_DENIED : error;
+        SetResultMessage(result, L"修改白名单需要以管理员身份运行。");
+        LogLine(L"拒绝 " + caller + L" 的白名单删除请求。");
+        return;
+    }
+
+    std::vector<std::wstring> parts;
+    if (!ParseStringPayload(payload.data(), payload.size(), parts) || parts.size() != 1) {
+        result.status = ERROR_INVALID_DATA;
+        SetResultMessage(result, L"请求格式错误。");
+        return;
+    }
+
+    std::wstring message;
+    error = RemoveAllowEntry(parts[0], message);
+    result.status = error;
+    SetResultMessage(result, message);
+
+    if (error == ERROR_SUCCESS) {
+        LogLine(L"管理员 " + caller + L" 删除了白名单条目：" + parts[0]);
+    }
+}
+
+void ServiceServer::HandleAllowList(HANDLE pipe) {
+    std::vector<AllowEntryInfo> entries;
+    std::wstring message;
+    ListAllowEntries(entries, message);
+
+    std::vector<std::byte> payload;
+    for (const AllowEntryInfo& entry : entries) {
+        const std::vector<std::byte> record =
+            MakeStringPayload({entry.name, entry.path, entry.sha256});
+        if (payload.size() + record.size() > kMaxPayloadBytes) {
+            LogLine(L"白名单条目过多，列表响应已截断。");
+            break;
+        }
+        payload.insert(payload.end(), record.begin(), record.end());
+    }
+
+    SendMessage(pipe, MessageType::AllowListResult, payload.data(), static_cast<uint32_t>(payload.size()));
 }
 
 } // namespace uiauf

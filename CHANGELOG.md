@@ -5,7 +5,6 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
 
 ## [0.1.0] - 2026-10-30
 
@@ -32,3 +31,8 @@
 - 白名单位于 HKLM，仅管理员可扩大授权范围；管道 ACL 对交互用户只开放读写。
 - 该实现绕过 Windows 对 UIAccess 的 Authenticode 签名与安全路径校验，属于非受支持的配置，
   请只在自有软件上使用。
+- 关闭"哈希校验"与"启动"之间的 TOCTOU 窗口：校验句柄改为 `FILE_SHARE_READ` 并持有到
+  `CreateProcessAsUser` 返回；进程以 `CREATE_SUSPENDED` 创建，比对实际映射映像的文件 ID
+  （卷序列号 + file index）通过后才 `ResumeThread`，不一致则终止进程。
+- 白名单条目改为写入解析后的最终路径，修正 `allow add` 与服务端比对口径不一致导致的
+  "加了却用不了"（失败关闭，非绕过）。

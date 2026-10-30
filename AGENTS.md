@@ -76,8 +76,10 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 /permissive- /I src /DUNICODE /D_UNICODE 
 
 1. **白名单是唯一授权来源。** 服务绝不能启动未经 `ResolveAllowedExecutable` 批准的二进制。
 2. **不提权。** 只能复制调用者自己的令牌，不得修改完整性级别、不得跨会话取令牌。
-3. **按最终路径校验、按最终路径启动。** 用 `GetFinalPathNameByHandleW` 消除短文件名 / 目录联接，
-   并且启动的就是被哈希校验过的那条路径，避免 TOCTOU 换文件。
+3. **按最终路径校验，并在启动时再次钉住映像。** 用 `GetFinalPathNameByHandleW` 消除短文件名 /
+   目录联接；校验用的句柄必须以 `FILE_SHARE_READ` 持有到 `CreateProcessAsUser` 返回，进程必须以
+   `CREATE_SUSPENDED` 创建，比对实际映射映像的文件 ID（卷序列号 + file index）后才能 `ResumeThread`。
+   不要把这些环节"简化"成先关句柄、再按路径启动。
 4. **管道 ACL 不放宽。** `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`，只允许交互用户读写，
    不要加 `WD`、`AN` 或 `Everyone`。
 5. **CLI 保持 `asInvoker`。** 不请求管理员清单、不自动提权；需要管理员的操作只打印提示。
@@ -126,7 +128,9 @@ HKLM\SOFTWARE\UIA-UF\Allow\<条目名>
 .\UIA-UF.Service.exe --uninstall
 ```
 
-同时确认：未在白名单中的程序被拒绝；篡改哈希后被拒绝；`--uninstall` 后管道不再存在。
+同时确认：未在白名单中的程序被拒绝；篡改哈希后被拒绝；**在服务运行期间把目标文件换成另一个 exe
+后被拒绝**（`CreateProcessAsUser` 前替换应因共享冲突打开失败，之后替换应被映像 ID 校验拦下）；
+`--uninstall` 后管道不再存在。
 
 ## 文档与版本
 

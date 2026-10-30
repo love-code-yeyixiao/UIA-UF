@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace uiauf {
 
@@ -110,6 +111,46 @@ inline std::wstring QuoteArgument(std::wstring_view argument) {
 
     quoted.push_back(L'"');
     return quoted;
+}
+
+// Enables a privilege on a token. Returns ERROR_SUCCESS when the privilege
+// ended up enabled (AdjustTokenPrivileges reports success even when it did not).
+inline DWORD EnablePrivilege(HANDLE token, const wchar_t* privilegeName) {
+    LUID luid{};
+    if (!LookupPrivilegeValueW(nullptr, privilegeName, &luid)) {
+        return GetLastError();
+    }
+
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr)) {
+        return GetLastError();
+    }
+    return GetLastError();
+}
+
+// Strips the \\?\ / \\?\UNC\ prefix that GetFinalPathNameByHandleW returns.
+inline std::wstring StripNtPrefix(std::wstring path) {
+    if (path.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+        return L"\\\\" + path.substr(8);
+    }
+    if (path.rfind(L"\\\\?\\", 0) == 0) {
+        return path.substr(4);
+    }
+    return path;
+}
+
+inline std::wstring FinalPathOf(HANDLE file) {
+    std::vector<wchar_t> buffer(32768);
+    const DWORD length = GetFinalPathNameByHandleW(file, buffer.data(), static_cast<DWORD>(buffer.size()),
+                                                   FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (length == 0 || length >= buffer.size()) {
+        return {};
+    }
+    return StripNtPrefix(std::wstring(buffer.data(), length));
 }
 
 } // namespace uiauf

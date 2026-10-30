@@ -4,6 +4,7 @@
 
 #include <string>
 
+#include "common/verified_image.h"
 #include "common/win32_helpers.h"
 
 namespace uiauf {
@@ -13,13 +14,11 @@ namespace uiauf {
 // ImpersonateNamedPipeClient active.
 DWORD DuplicateClientPrimaryToken(UniqueHandle& token, std::wstring& callerName);
 
-// Enables a privilege on the given token. Returns ERROR_SUCCESS when the
-// privilege ended up enabled.
-DWORD EnablePrivilege(HANDLE token, const wchar_t* privilegeName);
-
-// Stamps TokenUIAccess onto `primaryToken` and starts `executable` on the
-// interactive desktop of that token's session.
-DWORD LaunchWithUIAccess(HANDLE primaryToken, const std::wstring& executable, const std::wstring& arguments,
+// Stamps TokenUIAccess onto `primaryToken` and starts `image` on the
+// interactive desktop of that token's session. The process is created
+// suspended, its mapped image is compared against `image.identity`, and only
+// then resumed. `image.file` must stay open for the duration of this call.
+DWORD LaunchWithUIAccess(HANDLE primaryToken, const VerifiedImage& image, const std::wstring& arguments,
                          DWORD& childPid, std::wstring& errorText);
 
 } // namespace uiauf
