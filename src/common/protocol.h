@@ -1,0 +1,112 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// Wire protocol shared by UIA-UF.Service.exe and uiauf.exe.
+//
+// Transport: named pipe, byte mode, message framed by MessageHeader.
+// All strings on the wire are UTF-16LE.
+
+namespace uiauf {
+
+inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\UIA-UF.v1";
+
+inline constexpr wchar_t kServiceName[] = L"UIA-UF";
+inline constexpr wchar_t kServiceDisplayName[] = L"UIA-UF Service";
+inline constexpr wchar_t kServiceDescription[] =
+    L"Launches allow-listed applications with the UIAccess token flag set.";
+
+// HKLM is writable by administrators only: that is the trust anchor of the
+// whole framework. See docs in README.md.
+inline constexpr wchar_t kRegistryAllowKey[] = L"SOFTWARE\\UIA-UF\\Allow";
+
+inline constexpr uint32_t kProtocolMagic = 0x46414955u; // 'U','I','A','F'
+inline constexpr uint16_t kProtocolVersion = 1;
+inline constexpr uint32_t kMaxPayloadBytes = 64u * 1024u;
+
+enum class MessageType : uint16_t {
+    Ping = 1,
+    Pong = 2,
+    Launch = 3,
+    LaunchResult = 4,
+};
+
+#pragma warning(push)
+#pragma warning(disable : 4200 4324)
+#pragma pack(push, 1)
+
+struct MessageHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t type;
+    uint32_t payloadSize;
+};
+
+struct PingResult {
+    uint32_t protocolVersion;
+    uint32_t servicePid;
+    uint32_t reserved;
+};
+
+// status == 0 means success, otherwise it is the Win32 error code that made
+// the service give up. message carries a human readable explanation.
+struct LaunchResult {
+    uint32_t status;
+    uint32_t childPid;
+    wchar_t message[256];
+};
+
+#pragma pack(pop)
+#pragma warning(pop)
+
+// Launch payload: exe path and command line arguments, each a NUL terminated
+// UTF-16 string, the second one directly following the first terminator.
+inline std::vector<std::byte> MakeLaunchPayload(std::wstring_view exe, std::wstring_view args) {
+    const size_t chars = exe.size() + 1 + args.size() + 1;
+    std::vector<std::byte> payload(chars * sizeof(wchar_t));
+    wchar_t* cursor = reinterpret_cast<wchar_t*>(payload.data());
+    if (!exe.empty()) {
+        std::memcpy(cursor, exe.data(), exe.size() * sizeof(wchar_t));
+    }
+    cursor += exe.size();
+    *cursor++ = L'\0';
+    if (!args.empty()) {
+        std::memcpy(cursor, args.data(), args.size() * sizeof(wchar_t));
+    }
+    cursor += args.size();
+    *cursor = L'\0';
+    return payload;
+}
+
+inline bool ParseLaunchPayload(const std::byte* data, size_t size, std::wstring& exe, std::wstring& args) {
+    if (size < 2 * sizeof(wchar_t) || size % sizeof(wchar_t) != 0) {
+        return false;
+    }
+
+    const wchar_t* text = reinterpret_cast<const wchar_t*>(data);
+    const size_t count = size / sizeof(wchar_t);
+    if (text[count - 1] != L'\0') {
+        return false;
+    }
+
+    size_t exeLength = 0;
+    while (exeLength < count && text[exeLength] != L'\0') {
+        ++exeLength;
+    }
+    if (exeLength == count) {
+        return false;
+    }
+
+    const size_t argsStart = exeLength + 1;
+    const size_t argsLength = count - argsStart - 1;
+    exe.assign(text, exeLength);
+    args.assign(text + argsStart, argsLength);
+    return true;
+}
+
+} // namespace uiauf
