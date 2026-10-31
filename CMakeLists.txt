@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(UIA-UF VERSION 0.1.0 LANGUAGES CXX)
+project(UIA-UF VERSION 0.0.1 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "UIA-UF only targets Windows.")
