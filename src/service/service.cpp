@@ -1,11 +1,16 @@
 #include "service/service.h"
 
+#include <wtsapi32.h>
+
+#include <atomic>
 #include <iterator>
 #include <string>
+#include <thread>
 
 #include "common/protocol.h"
 #include "common/win32_helpers.h"
 #include "service/allowlist.h"
+#include "service/lifecycle.h"
 #include "service/log.h"
 #include "service/server.h"
 
@@ -17,13 +22,18 @@ SERVICE_STATUS g_status{};
 DWORD g_checkpoint = 0;
 ServiceServer* g_server = nullptr;
 
+HANDLE g_sessionEvent = nullptr;
+std::atomic<DWORD> g_pendingSession{0};
+
 void ReportStatus(DWORD state, DWORD exitCode = NO_ERROR, DWORD waitHint = 0) {
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwCurrentState = state;
     g_status.dwWin32ExitCode = exitCode;
     g_status.dwWaitHint = waitHint;
     g_status.dwControlsAccepted =
-        (state == SERVICE_RUNNING) ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
+        (state == SERVICE_RUNNING)
+            ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE)
+            : 0;
     g_status.dwCheckPoint =
         (state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING) ? ++g_checkpoint : 0;
 
@@ -33,8 +43,6 @@ void ReportStatus(DWORD state, DWORD exitCode = NO_ERROR, DWORD waitHint = 0) {
 }
 
 DWORD WINAPI ControlHandler(DWORD control, DWORD eventType, LPVOID eventData, LPVOID context) {
-    UNREFERENCED_PARAMETER(eventType);
-    UNREFERENCED_PARAMETER(eventData);
     UNREFERENCED_PARAMETER(context);
 
     switch (control) {
@@ -43,6 +51,13 @@ DWORD WINAPI ControlHandler(DWORD control, DWORD eventType, LPVOID eventData, LP
         ReportStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
         if (g_server != nullptr) {
             g_server->RequestStop();
+        }
+        return NO_ERROR;
+    case SERVICE_CONTROL_SESSIONCHANGE:
+        if (eventType == WTS_SESSION_LOGON && eventData != nullptr && g_sessionEvent != nullptr) {
+            const auto* notification = static_cast<const WTSSESSION_NOTIFICATION*>(eventData);
+            g_pendingSession.store(notification->dwSessionId);
+            SetEvent(g_sessionEvent);
         }
         return NO_ERROR;
     case SERVICE_CONTROL_INTERROGATE:
@@ -85,9 +100,6 @@ std::wstring ServiceImagePath() {
 } // namespace
 
 void WINAPI ServiceMain(DWORD argc, LPWSTR* argv) {
-    UNREFERENCED_PARAMETER(argc);
-    UNREFERENCED_PARAMETER(argv);
-
     g_statusHandle = RegisterServiceCtrlHandlerExW(kServiceName, ControlHandler, nullptr);
     if (g_statusHandle == nullptr) {
         LogError(L"RegisterServiceCtrlHandlerEx", GetLastError());
@@ -97,8 +109,22 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv) {
     ReportStatus(SERVICE_START_PENDING, NO_ERROR, 5000);
     LogLine(L"服务正在启动。");
 
+    const wchar_t* setupMode = nullptr;
+    for (DWORD index = 1; index < argc; ++index) {
+        if (_wcsicmp(argv[index], L"--standalone") == 0) {
+            setupMode = L"--standalone";
+        } else if (_wcsicmp(argv[index], L"--bundled") == 0) {
+            setupMode = L"--bundled";
+        }
+    }
+
     std::wstring keyMessage;
     EnsureAllowListKey(keyMessage);
+
+    std::wstring setupMessage;
+    EnsureSetupRegistration(setupMode, setupMessage);
+
+    g_sessionEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     ServiceServer server;
     g_server = &server;
@@ -108,13 +134,39 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv) {
         return;
     }
 
+    std::thread lifecycle([&server] {
+        const DWORD consoleSession = WTSGetActiveConsoleSessionId();
+        if (consoleSession != 0xFFFFFFFF) {
+            EvaluateIdlePolicy(consoleSession);
+        }
+
+        for (;;) {
+            const HANDLE waits[] = {server.StopEvent(), g_sessionEvent};
+            const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0) {
+                break;
+            }
+            if (wait == WAIT_OBJECT_0 + 1) {
+                EvaluateIdlePolicy(g_pendingSession.load());
+            }
+        }
+    });
+
     ReportStatus(SERVICE_RUNNING);
 
     WaitForSingleObject(server.StopEvent(), INFINITE);
 
     ReportStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+    if (lifecycle.joinable()) {
+        lifecycle.join();
+    }
     server.Wait();
     g_server = nullptr;
+
+    if (g_sessionEvent != nullptr) {
+        CloseHandle(g_sessionEvent);
+        g_sessionEvent = nullptr;
+    }
 
     LogLine(L"服务已停止。");
     ReportStatus(SERVICE_STOPPED);
@@ -185,7 +237,7 @@ DWORD UninstallService() {
     return ERROR_SUCCESS;
 }
 
-DWORD StartServiceIfNeeded() {
+DWORD StartServiceIfNeeded(const wchar_t* setupMode) {
     UniqueScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
     if (!scm) {
         return GetLastError();
@@ -196,7 +248,10 @@ DWORD StartServiceIfNeeded() {
         return GetLastError();
     }
 
-    if (!StartServiceW(service.get(), 0, nullptr)) {
+    LPCWSTR arguments[1] = {setupMode};
+    const DWORD argumentCount = (setupMode != nullptr) ? 1 : 0;
+
+    if (!StartServiceW(service.get(), argumentCount, argumentCount > 0 ? arguments : nullptr)) {
         const DWORD error = GetLastError();
         if (error != ERROR_SERVICE_ALREADY_RUNNING) {
             return error;
@@ -232,6 +287,16 @@ int RunInConsole() {
         wprintf(L"警告：当前进程未提升，无法获得 SeTcbPrivilege，启动请求会失败。\n");
     } else {
         wprintf(L"提示：SeTcbPrivilege 通常只授予 LocalSystem，普通管理员身份仍可能失败。\n");
+    }
+
+    std::wstring keyMessage;
+    EnsureAllowListKey(keyMessage);
+    std::wstring setupMessage;
+    EnsureSetupRegistration(nullptr, setupMessage);
+
+    const DWORD consoleSession = WTSGetActiveConsoleSessionId();
+    if (consoleSession != 0xFFFFFFFF) {
+        EvaluateIdlePolicy(consoleSession);
     }
 
     ServiceServer server;

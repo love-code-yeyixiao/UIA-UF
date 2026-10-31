@@ -37,6 +37,12 @@ struct AllowEntry {
 };
 
 constexpr DWORD kMaxPathChars = 32768;
+constexpr wchar_t kLastChangedValue[] = L"LastChanged";
+
+void WriteAllowListChangedAt(ULONGLONG fileTime) {
+    RegSetKeyValueW(HKEY_LOCAL_MACHINE, kRegistryAllowKey, kLastChangedValue, REG_QWORD, &fileTime,
+                    sizeof(fileTime));
+}
 
 // Lexically normalises a path. Does not touch the file system.
 DWORD NormalizePath(const std::wstring& input, std::wstring& output) {
@@ -210,6 +216,12 @@ DWORD OpenImage(const std::wstring& requested, OpenedImage& opened, std::wstring
 
 } // namespace
 
+bool ReadAllowListChangedAt(ULONGLONG& fileTime) {
+    DWORD bytes = sizeof(fileTime);
+    return RegGetValueW(HKEY_LOCAL_MACHINE, kRegistryAllowKey, kLastChangedValue, RRF_RT_REG_QWORD, nullptr,
+                        &fileTime, &bytes) == ERROR_SUCCESS;
+}
+
 DWORD EnsureAllowListKey(std::wstring& message) {
     message.clear();
 
@@ -242,9 +254,17 @@ DWORD EnsureAllowListKey(std::wstring& message) {
     }
 
     PACL dacl = nullptr;
-    BOOL present = FALSE;
-    BOOL defaulted = FALSE;
-    GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted);
+    BOOL daclPresent = FALSE;
+    BOOL daclDefaulted = FALSE;
+    GetSecurityDescriptorDacl(descriptor, &daclPresent, &dacl, &daclDefaulted);
+
+    // Absolute-format descriptor carrying both the SYSTEM owner and the
+    // protected DACL; RegSetKeySecurity applies both in one call.
+    SECURITY_DESCRIPTOR absolute{};
+    InitializeSecurityDescriptor(&absolute, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorOwner(&absolute, systemSid, FALSE);
+    SetSecurityDescriptorDacl(&absolute, TRUE, dacl, FALSE);
+    SetSecurityDescriptorControl(&absolute, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
 
     DWORD result = ERROR_SUCCESS;
     for (const wchar_t* path : {L"SOFTWARE\\UIA-UF", kRegistryAllowKey}) {
@@ -262,14 +282,41 @@ DWORD EnsureAllowListKey(std::wstring& message) {
         }
         UniqueRegKey key(rawKey);
 
-        const DWORD securityStatus =
-            SetSecurityInfo(key.get(), SE_REGISTRY_KEY,
-                            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
-                                PROTECTED_DACL_SECURITY_INFORMATION,
-                            nullptr, systemSid, dacl, nullptr);
-        if (securityStatus != ERROR_SUCCESS) {
-            result = securityStatus;
-            message = L"无法收紧注册表项 " + std::wstring(path) + FormatWin32Error(securityStatus);
+        // SetSecurityInfo rejects registry objects, so ownership and the
+        // protected DACL both go through RegSetKeySecurity.
+        const DWORD stepError = RegSetKeySecurity(
+            key.get(), OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &absolute);
+        if (stepError != ERROR_SUCCESS) {
+            result = stepError;
+            message = L"无法收紧注册表项 " + std::wstring(path) + FormatWin32Error(stepError);
+            break;
+        }
+
+        DWORD bytes = 0;
+        RegGetKeySecurity(key.get(), DACL_SECURITY_INFORMATION, nullptr, &bytes);
+        if (bytes == 0) {
+            result = ERROR_INVALID_DATA;
+            message = L"无法读取注册表项 DACL " + std::wstring(path);
+            break;
+        }
+
+        std::vector<BYTE> buffer(bytes);
+        const LSTATUS readStatus = RegGetKeySecurity(
+            key.get(), DACL_SECURITY_INFORMATION, reinterpret_cast<PSECURITY_DESCRIPTOR>(buffer.data()),
+            &bytes);
+        if (readStatus != ERROR_SUCCESS) {
+            result = readStatus;
+            message = L"无法读取注册表项 DACL " + std::wstring(path) + FormatWin32Error(readStatus);
+            break;
+        }
+
+        SECURITY_DESCRIPTOR_CONTROL control = 0;
+        DWORD revision = 0;
+        if (!GetSecurityDescriptorControl(reinterpret_cast<PSECURITY_DESCRIPTOR>(buffer.data()), &control,
+                                          &revision) ||
+            (control & SE_DACL_PROTECTED) == 0) {
+            result = ERROR_INVALID_STATE;
+            message = L"注册表项 DACL 未能标记为受保护：" + std::wstring(path);
             break;
         }
     }
@@ -278,6 +325,12 @@ DWORD EnsureAllowListKey(std::wstring& message) {
     LocalFree(descriptor);
 
     if (result == ERROR_SUCCESS) {
+        // Seed the idle-cleanup clock the first time the key is created; do not
+        // refresh it on later starts, otherwise every boot would reset it.
+        ULONGLONG changedAt = 0;
+        if (!ReadAllowListChangedAt(changedAt)) {
+            WriteAllowListChangedAt(NowFileTime());
+        }
         LogLine(L"白名单注册表项已限制为仅 SYSTEM 可写。");
     } else {
         LogLine(L"收紧白名单注册表项失败：" + message);
@@ -381,6 +434,7 @@ DWORD AddAllowEntry(const std::wstring& requested, const std::wstring& expectedS
     }
 
     message = L"已注册 [" + name + L"]\n  Path   = " + opened.path + L"\n  Sha256 = " + opened.digest;
+    WriteAllowListChangedAt(NowFileTime());
     LogLine(L"allowlist entry added: " + name + L" -> " + opened.path);
     return ERROR_SUCCESS;
 }
@@ -401,6 +455,7 @@ DWORD RemoveAllowEntry(const std::wstring& name, std::wstring& message) {
     }
 
     message = L"已删除 [" + name + L"]";
+    WriteAllowListChangedAt(NowFileTime());
     LogLine(L"allowlist entry removed: " + name);
     return ERROR_SUCCESS;
 }

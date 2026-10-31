@@ -75,6 +75,8 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 /permissive- /I src /DUNICODE /D_UNICODE 
 ## 安全契约（不要破坏）
 
 1. **白名单是唯一授权来源。** 服务绝不能启动未经 `ResolveAllowedExecutable` 批准的二进制。
+   唯一例外是闲置提醒：服务可以启动 `Setup\ClientPath` 中登记、且哈希校验通过的客户端
+   `notify` 子命令，不要把这个例外扩大到任意路径。
 2. **哈希强制。** 条目缺少有效 `Sha256` 一律按未授权处理；注册必须由调用方提交预期哈希，
    服务端重算比对后才写入，且写入的是服务端算出的值。
 3. **白名单只能经服务修改。** 键的 ACL 仅 SYSTEM 可写，`allow add/remove` 必须走管道；
@@ -114,6 +116,13 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 /permissive- /I src /DUNICODE /D_UNICODE 
 HKLM\SOFTWARE\UIA-UF\Allow\<条目名>      属主 SYSTEM，受保护 DACL，仅 SYSTEM 可写（BA 只读）
     Path   (REG_SZ)        必填，可执行文件的最终路径
     Sha256 (REG_SZ)        必填，64 位十六进制；缺失即视为未授权
+HKLM\SOFTWARE\UIA-UF\Setup               安装登记，仅服务写入
+    ClientPath       (REG_SZ)     登记的客户端路径
+    ClientSha256     (REG_SZ)     安装时的客户端哈希
+    ClientLastWrite  (REG_QWORD)  客户端文件最后修改时间（FILETIME）
+    InstalledAt      (REG_QWORD)  首次登记时间（FILETIME）
+    Standalone       (REG_DWORD)  1 = 独立安装，跳过闲置清理
+    WarnedAt         (REG_QWORD)  上次闲置提醒时间（FILETIME）
 %ProgramData%\UIA-UF\service.log   UTF-16LE，带 BOM
 ```
 
@@ -125,6 +134,16 @@ HKLM\SOFTWARE\UIA-UF\Allow\<条目名>      属主 SYSTEM，受保护 DACL，仅
   服务端算出的值。这样"释放文件 → 登记"之间被换文件会注册失败，而不是被静默登记。
 - 本地管理员理论上仍可夺取属主后改写该键——ACL 收紧提高的是门槛，不是对本地管理员的
   权限边界，不要把这条当成防提权保证。
+
+## 闲置清理策略
+
+- 仅当 `Standalone=0` 时生效。`ClientLastWrite` 超过 15 天，且白名单"无可用条目"
+  （为空，或全部条目指向的文件都不存在）时才触发——只查存在性，不查哈希，这是卫生检查
+  而不是授权判断。
+- 触发时先校验 `ClientPath` 的哈希，通过才启动 `notify` 通知；不通过只记日志，绝不提醒。
+- 提醒后再过 15 天仍未处理，目前**只记录日志**。自动卸载是破坏性动作（停服务、删服务、
+  删注册表、删二进制），必须先明确范围、失败回滚和误判处理，不能顺手加进来。
+- 只要新增了可用条目，`WarnedAt` 会被清除，避免以后再次闲置时反而不再提醒。
 
 ## 验证清单
 
@@ -145,6 +164,10 @@ HKLM\SOFTWARE\UIA-UF\Allow\<条目名>      属主 SYSTEM，受保护 DACL，仅
 被拒绝**（失败关闭）；**在服务运行期间把目标文件换成另一个 exe 后被拒绝**
 （`CreateProcessAsUser` 前替换应因共享冲突打开失败，之后替换应被映像 ID 校验拦下）；
 `--uninstall` 后管道不再存在。
+
+闲置策略单独验一次：把 `Setup\ClientLastWrite` 改成 20 天前、保持白名单为空，重启服务后
+在用户会话应收到通知，`WarnedAt` 被写入；把 `Standalone` 设为 1 后不再触发；加一个可用
+条目后 `WarnedAt` 被清除。
 
 ## 文档与版本
 

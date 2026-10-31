@@ -40,4 +40,8 @@ DWORD AddAllowEntry(const std::wstring& requested, const std::wstring& expectedS
 DWORD RemoveAllowEntry(const std::wstring& name, std::wstring& message);
 DWORD ListAllowEntries(std::vector<AllowEntryInfo>& entries, std::wstring& message);
 
+// Time of the last allow list modification, in FILETIME units. Returns false
+// when the key or the bookkeeping value does not exist yet.
+bool ReadAllowListChangedAt(ULONGLONG& fileTime);
+
 } // namespace uiauf

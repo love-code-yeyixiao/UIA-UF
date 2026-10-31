@@ -82,8 +82,13 @@ inline bool IsElevated() {
     return IsHighIntegrityToken(token.get());
 }
 
-inline bool EqualsIgnoreCase(std::wstring_view left, std::wstring_view right) {
-    if (left.size() != right.size()) {
+inline ULONGLONG NowFileTime() {
+    FILETIME time{};
+    GetSystemTimeAsFileTime(&time);
+    return (static_cast<ULONGLONG>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+}
+
+inline bool EqualsIgnoreCase(std::wstring_view left, std::wstring_view right) {    if (left.size() != right.size()) {
         return false;
     }
     return _wcsnicmp(left.data(), right.data(), left.size()) == 0;

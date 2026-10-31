@@ -30,19 +30,20 @@ target_include_directories(uiauf_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/sr
 add_executable(uiauf_service
     src/service/allowlist.cpp
     src/service/launcher.cpp
+    src/service/lifecycle.cpp
     src/service/log.cpp
     src/service/main.cpp
     src/service/server.cpp
     src/service/service.cpp
 )
 set_target_properties(uiauf_service PROPERTIES OUTPUT_NAME "UIA-UF.Service")
-target_link_libraries(uiauf_service PRIVATE uiauf_common advapi32 bcrypt user32 userenv)
+target_link_libraries(uiauf_service PRIVATE uiauf_common advapi32 bcrypt user32 userenv wtsapi32)
 
 # ---------------------------------------------------------------------------
 # uiauf.exe -- client side launcher / inspector.
 # ---------------------------------------------------------------------------
-add_executable(uiauf src/cli/main.cpp)
-target_link_libraries(uiauf PRIVATE uiauf_common advapi32 bcrypt)
+add_executable(uiauf src/cli/main.cpp src/cli/toast.cpp)
+target_link_libraries(uiauf PRIVATE uiauf_common advapi32 bcrypt shell32 user32)
 
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT uiauf)
 

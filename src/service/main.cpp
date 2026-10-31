@@ -24,6 +24,7 @@ int PrintUsage() {
                   L"\n"
                   L"用法:\n"
                   L"  UIA-UF.Service.exe --install     安装并启动服务（需要管理员权限）\n"
+                  L"      --StandaloneSetup              独立安装：跳过闲置自动清理检查\n"
                   L"  UIA-UF.Service.exe --uninstall   停止并删除服务（需要管理员权限）\n"
                   L"  UIA-UF.Service.exe --start       启动已安装的服务\n"
                   L"  UIA-UF.Service.exe --stop        停止服务\n"
@@ -70,12 +71,22 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring_view mode = argv[1];
 
     if (mode == L"--install") {
+        bool standalone = false;
+        for (int index = 2; index < argc; ++index) {
+            if (_wcsicmp(argv[index], L"--StandaloneSetup") == 0) {
+                standalone = true;
+            }
+        }
+
         DWORD error = uiauf::InstallService();
         PrintResult(L"安装服务", error);
         if (error != ERROR_SUCCESS) {
             return 1;
         }
-        error = uiauf::StartServiceIfNeeded();
+
+        // Restart so the installation mode is applied even if an old instance is running.
+        uiauf::StopServiceIfRunning();
+        error = uiauf::StartServiceIfNeeded(standalone ? L"--standalone" : L"--bundled");
         PrintResult(L"启动服务", error);
         return error == ERROR_SUCCESS ? 0 : 1;
     }

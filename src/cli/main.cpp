@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cli/toast.h"
 #include "common/hash.h"
 #include "common/protocol.h"
 #include "common/protocol_io.h"
@@ -34,6 +35,7 @@ void PrintUsage() {
                   L"  uiauf allow list                           列出白名单\n"
                   L"  uiauf allow add <文件>                     注册白名单条目（管理员，自动锁定哈希）\n"
                   L"  uiauf allow remove <名称>                  删除白名单条目（管理员）\n"
+                  L"  uiauf notify --title <标题> --message <正文>  发送一条通知（供服务调用）\n"
                   L"  uiauf help                                 显示本帮助\n"
                   L"\n"
                   L"白名单位于 HKLM\\SOFTWARE\\UIA-UF\\Allow\\<名称>，ACL 仅允许 SYSTEM 写入，\n"
@@ -372,6 +374,26 @@ int AllowRemoveCommand(const std::vector<std::wstring>& positional) {
                             uiauf::MakeStringPayload({positional[2]}));
 }
 
+int NotifyCommand(int argc, wchar_t** argv) {
+    std::wstring title = L"UIA-UF";
+    std::wstring message;
+
+    for (int index = 2; index < argc; ++index) {
+        if (_wcsicmp(argv[index], L"--title") == 0 && index + 1 < argc) {
+            title = argv[++index];
+        } else if (_wcsicmp(argv[index], L"--message") == 0 && index + 1 < argc) {
+            message = argv[++index];
+        }
+    }
+
+    if (message.empty()) {
+        std::fwprintf(stderr, L"notify: 缺少 --message。\n");
+        return 2;
+    }
+
+    return uiauf::ShowToast(title, message) ? 0 : 1;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -385,6 +407,10 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring_view command = argv[1];
     std::vector<std::wstring> positional;
     bool waitForExit = false;
+
+    if (command == L"notify") {
+        return NotifyCommand(argc, argv);
+    }
 
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--wait") == 0) {
