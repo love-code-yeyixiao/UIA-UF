@@ -12,10 +12,14 @@
 
 - `uiauf notify --title <标题> --message <正文>`：在当前会话弹通知（`Shell_NotifyIcon`，
   Win10/11 由系统通知中心呈现）。
-- 安装登记：服务首次启动时把客户端路径、SHA-256、最后修改时间写入
+- 安装登记：服务首次启动时把客户端路径与 SHA-256 写入
   `HKLM\SOFTWARE\UIA-UF\Setup`；`--install` 时强制重新登记。
-- 闲置清理提醒：客户端超过 15 天未更新、且白名单没有可用条目时，在用户会话登录后校验
-  客户端哈希并弹通知；`--install --StandaloneSetup` 可关闭该检查。
+- 白名单修改时间：`Allow\LastChanged` 在条目增删时刷新，服务启动不会重置。
+- 闲置清理提醒：白名单超过 15 天未修改、且没有可用条目时，在用户会话登录后校验客户端
+  哈希并弹通知；`--install --StandaloneSetup` 可关闭该检查。
+- `tests/`：基于 PowerShell 的测试（不依赖 Pester），含 CLI 行为测试与服务端集成测试；
+  `Run-Tests.ps1 -SkipServiceTests` 可在受限环境只跑 CLI 部分。
+- CI 新增 `tests` 作业：下载 Release 产物后执行完整测试，标签发布依赖它通过。
 
 ### Changed
 

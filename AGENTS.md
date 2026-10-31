@@ -48,8 +48,31 @@ cmake --preset debug          # 或 release / vs2022
 cmake --build --preset debug
 ```
 
-CI（`.github/workflows/build.yml`）在 `windows-2022` 上构建 Debug 与 Release，跑一次 `uiauf help` 冒烟，
-并上传两个 exe；打 `v*` 标签时自动发布 zip。**本地提交前至少保证 MSVC `/W4` 无新增警告。**
+CI（`.github/workflows/build.yml`）在 `windows-2022` 上构建 Debug 与 Release，运行
+`tests/` 下的测试，并上传两个 exe；打 `v*` 标签时自动发布 zip。**本地提交前至少保证
+MSVC `/W4` 无新增警告，且 `tests/Run-Tests.ps1` 通过。**
+
+## 测试
+
+`tests/` 下是基于 PowerShell 的测试，不依赖 Pester：
+
+| 文件 | 内容 |
+| --- | --- |
+| `Run-Tests.ps1` | 入口：依次执行 `*.Tests.ps1`，汇总并设置退出码 |
+| `TestHelpers.ps1` | `Test` / `Assert-*` / `Invoke-Tool`（捕获输出与退出码） |
+| `Cli.Tests.ps1` | CLI 行为：help、错误参数、缺少文件、服务离线时的退出码 |
+| `Service.Tests.ps1` | 集成：安装服务 → 注册 → 启动 → `check` → 篡改拒绝 → 删除 → 卸载 |
+
+```powershell
+pwsh -File tests\Run-Tests.ps1 -BinDir build\release
+pwsh -File tests\Run-Tests.ps1 -BinDir out -SkipServiceTests   # 无法装服务的环境
+```
+
+- 服务端集成测试需要管理员权限；不满足时会**整体跳过**而不是失败。
+- 脚本必须保存为 **UTF-8 with BOM**，否则 Windows PowerShell 5.1 会把中文按 ANSI 解析，
+  直接报语法错误。
+- 集成测试会真的创建并启动服务、拉起进程、最后在 `finally` 里卸载，不要在正在使用的
+  机器上直接跑。
 
 只有 `cl.exe`、没有可用 CMake 环境时的等价编译命令：
 
@@ -116,10 +139,11 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 /permissive- /I src /DUNICODE /D_UNICODE 
 HKLM\SOFTWARE\UIA-UF\Allow\<条目名>      属主 SYSTEM，受保护 DACL，仅 SYSTEM 可写（BA 只读）
     Path   (REG_SZ)        必填，可执行文件的最终路径
     Sha256 (REG_SZ)        必填，64 位十六进制；缺失即视为未授权
+HKLM\SOFTWARE\UIA-UF\Allow
+    LastChanged (REG_QWORD)  白名单最后一次增删的时间（FILETIME），闲置清理用它计时
 HKLM\SOFTWARE\UIA-UF\Setup               安装登记，仅服务写入
     ClientPath       (REG_SZ)     登记的客户端路径
     ClientSha256     (REG_SZ)     安装时的客户端哈希
-    ClientLastWrite  (REG_QWORD)  客户端文件最后修改时间（FILETIME）
     InstalledAt      (REG_QWORD)  首次登记时间（FILETIME）
     Standalone       (REG_DWORD)  1 = 独立安装，跳过闲置清理
     WarnedAt         (REG_QWORD)  上次闲置提醒时间（FILETIME）
@@ -137,9 +161,9 @@ HKLM\SOFTWARE\UIA-UF\Setup               安装登记，仅服务写入
 
 ## 闲置清理策略
 
-- 仅当 `Standalone=0` 时生效。`ClientLastWrite` 超过 15 天，且白名单"无可用条目"
-  （为空，或全部条目指向的文件都不存在）时才触发——只查存在性，不查哈希，这是卫生检查
-  而不是授权判断。
+- 仅当 `Standalone=0` 时生效。白名单距上次修改（`Allow\LastChanged`，从未修改则用
+  `InstalledAt`）超过 15 天，且白名单"无可用条目"（为空，或全部条目指向的文件都不存在）
+  时才触发——只查存在性，不查哈希，这是卫生检查而不是授权判断。
 - 触发时先校验 `ClientPath` 的哈希，通过才启动 `notify` 通知；不通过只记日志，绝不提醒。
 - 提醒后再过 15 天仍未处理，目前**只记录日志**。自动卸载是破坏性动作（停服务、删服务、
   删注册表、删二进制），必须先明确范围、失败回滚和误判处理，不能顺手加进来。

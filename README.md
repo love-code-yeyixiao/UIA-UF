@@ -31,8 +31,15 @@ cmake --build --preset debug
 
 产物：`build/debug/UIA-UF.Service.exe`、`build/debug/uiauf.exe`。
 
-CI 在 `windows-2022` 上构建 Debug 与 Release 两个配置，产物可在 Actions 页面下载；
-推送 `v*` 标签会自动创建 Release 并附上 Release 版 zip。
+CI 在 `windows-2022` 上构建 Debug 与 Release 两个配置，跑 `tests/` 下的测试，
+产物可在 Actions 页面下载；推送 `v*` 标签会自动创建 Release 并附上 Release 版 zip。
+
+本地也可以跑同一套测试：
+
+```powershell
+pwsh -File tests\Run-Tests.ps1 -BinDir out                     # 需要管理员 + 能装服务
+pwsh -File tests\Run-Tests.ps1 -BinDir out -SkipServiceTests   # 只跑 CLI 部分
+```
 
 ## 安装与卸载
 
@@ -50,15 +57,17 @@ CI 在 `windows-2022` 上构建 Debug 与 Release 两个配置，产物可在 Ac
 
 ## 闲置清理（捆绑安装场景）
 
-服务首次启动时会把客户端 `uiauf.exe` 的路径、SHA-256 与最后修改时间登记到
-`HKLM\SOFTWARE\UIA-UF\Setup`。当以下条件同时成立：
+服务首次启动时会把客户端 `uiauf.exe` 的路径与 SHA-256 登记到
+`HKLM\SOFTWARE\UIA-UF\Setup`，同时开始记录白名单的**最后修改时间**
+（`Allow\LastChanged`）。当以下条件同时成立：
 
-- 客户端最后修改时间距现在超过 **15 天**；
+- 白名单距上次修改已超过 **15 天**（从未修改过则从安装登记时间起算）；
 - 白名单为空，**或**所有条目指向的文件都已不存在（只检查存在性，不校验哈希）；
 - 安装时没有指定 `--StandaloneSetup`；
 
 服务会在检测到用户会话登录后校验客户端哈希，通过则拉起客户端弹出一条通知，提示
-"15 天内不处理将自动卸载"。期间只要新增了可用条目，警告状态就会被清除。
+"15 天内不处理将自动卸载"。期间只要新增或删除条目，时间戳就会刷新，警告状态也会在
+白名单重新可用时被清除。
 
 ```powershell
 UIA-UF.Service.exe --install --StandaloneSetup   # 用户主动安装：跳过该检查
