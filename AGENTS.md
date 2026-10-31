@@ -61,6 +61,7 @@ MSVC `/W4` 无新增警告，且 `tests/Run-Tests.ps1` 通过。**
 | `Run-Tests.ps1` | 入口：依次执行 `*.Tests.ps1`，汇总并设置退出码 |
 | `TestHelpers.ps1` | `Test` / `Assert-*` / `Invoke-Tool`（捕获输出与退出码） |
 | `Cli.Tests.ps1` | CLI 行为：help、错误参数、缺少文件、服务离线时的退出码 |
+| `Idle.Tests.ps1` | 闲置策略：到点自动禁用、CLI 提示、重新安装恢复 |
 | `Service.Tests.ps1` | 集成：安装服务 → 注册 → 启动 → `check` → 篡改拒绝 → 删除 → 卸载 |
 
 ```powershell
@@ -69,6 +70,9 @@ pwsh -File tests\Run-Tests.ps1 -BinDir out -SkipServiceTests   # 无法装服务
 ```
 
 - 服务端集成测试需要管理员权限；不满足时会**整体跳过**而不是失败。
+- `Idle.Tests.ps1` 必须在 `Service.Tests.ps1` **之前**执行（文件名排序保证了这一点）：服务一旦
+  启动就会把 `HKLM\SOFTWARE\UIA-UF` 收紧为仅 SYSTEM 可写，之后连管理员也改不了，预置状态
+  就写不进去了。它还需要干净的注册表状态，检测到键已被收紧时会跳过并给出提示。
 - 脚本必须保存为 **UTF-8 with BOM**，否则 Windows PowerShell 5.1 会把中文按 ANSI 解析，
   直接报语法错误。
 - 集成测试会真的创建并启动服务、拉起进程、最后在 `finally` 里卸载，不要在正在使用的

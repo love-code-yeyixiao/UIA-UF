@@ -20,7 +20,8 @@
 - 闲置宽限期结束后，服务会把自身 SCM 启动类型改为 `DISABLED` 并停止（不卸载、不删文件，
   `--install` 可恢复）；被禁用期间 CLI 会提示并每天最多弹一次通知。
 - `Setup\IdleDays` / `Setup\WarnDays`（DWORD，默认 15）可调整两个阈值，测试用它压缩时间。
-- 集成测试新增"闲置宽限期结束后自动禁用 / CLI 提示 / 重新安装恢复"三项。
+- 集成测试新增"闲置宽限期结束后自动禁用 / CLI 提示 / 重新安装恢复"三项
+  （`tests/Idle.Tests.ps1`，需在服务首次安装前运行）。
 - `tests/`：基于 PowerShell 的测试（不依赖 Pester），含 CLI 行为测试与服务端集成测试；
   `Run-Tests.ps1 -SkipServiceTests` 可在受限环境只跑 CLI 部分。
 - CI 新增 `tests` 作业：下载 Release 产物后执行完整测试，标签发布依赖它通过。
