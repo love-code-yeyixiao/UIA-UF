@@ -50,26 +50,40 @@ CI 在 `windows-2022` 上构建 Debug 与 Release 两个配置，产物可在 Ac
 
 ## 白名单
 
-白名单是唯一决定"谁能拿到 UIAccess"的地方，位于 `HKLM\SOFTWARE\UIA-UF\Allow`，
-只有管理员可写：
+白名单是唯一决定"谁能拿到 UIAccess"的地方，位于 `HKLM\SOFTWARE\UIA-UF\Allow`。
 
-```
-HKLM\SOFTWARE\UIA-UF\Allow\<条目名>
-    Path   (REG_SZ)        可执行文件完整路径，必填
-    Sha256 (REG_SZ, 可选)  允许的 SHA-256，缺省表示不校验哈希
-```
-
-用 CLI 管理（需要管理员权限的终端）：
+该键由服务在启动时创建，属主为 `SYSTEM`，DACL 受保护并收紧为 **仅 SYSTEM 可写**
+（Administrators 只读）。因此**管理员也不能直接改注册表**，所有修改都必须经由服务完成：
 
 ```powershell
-uiauf allow add "C:\Program Files\ClassIsland\ClassIsland.exe"          # 只绑定路径
-uiauf allow add "C:\Program Files\ClassIsland\ClassIsland.exe" --hash   # 同时锁定哈希
+uiauf allow add "C:\Program Files\ClassIsland\ClassIsland.exe"
 uiauf allow list
 uiauf allow remove ClassIsland
 ```
 
-服务端在启动程序前会：解析目标文件的最终路径（消除 `..`、符号链接与短文件名）→
-计算 SHA-256 → 与白名单逐条比对，只有完全匹配才继续。
+需要服务在线，且当前终端处于提升状态（高完整性级别）；授权判断由服务端完成。
+
+条目结构：
+
+```
+HKLM\SOFTWARE\UIA-UF\Allow\<条目名>
+    Path   (REG_SZ)   可执行文件最终路径，必填
+    Sha256 (REG_SZ)   必填，64 位十六进制
+```
+
+**哈希是强制项。** 缺少有效 `Sha256` 的条目一律按未授权处理（失败关闭）。条目名称取文件名
+（不含扩展名）。
+
+### 为什么要传"预期哈希"
+
+`allow add` 先在本地算一遍 SHA-256 并随请求提交，服务端随后**独立重算**并与之比对，
+不一致直接拒绝注册；最终写入注册表的是**服务端算出的哈希**。
+
+这样做的目的是堵住"安装程序释放文件 → 登记白名单"之间的窗口：如果这段时间文件被替换，
+两次观测必然不一致，注册会明确失败，而不是把一个被篡改的文件静默登记成合法条目。
+即使调用方谎报哈希也没用——服务端只信自己算出来的那份。
+
+目标程序更新后哈希会失配，需要重新执行 `allow add`。
 
 ## 使用
 
@@ -83,13 +97,18 @@ uiauf ping                                                  # 服务是否在线
 `uiauf check` 直接读取目标进程的 `TokenUIAccess`，可作为验证手段：
 
 ```
-PID 1234: UIAccess = yes, Elevated = no
+PID 1234: UIAccess = yes, Elevated = no (IL 0x2000)
 ```
+
+`Elevated` 与括号里的完整性级别来自令牌的 `TokenIntegrityLevel`（`TokenElevation` 在复制/模拟
+令牌上不可靠）。
 
 ## 安全模型
 
-- **只有管理员能扩大授权范围**。白名单在 HKLM 下，普通用户无法新增条目；服务不会因为
-  收到请求就放行任意程序。
+- **只有 SYSTEM 能写白名单**。`Allow` 键的属主是 SYSTEM、DACL 受保护且只给 SYSTEM 写权限，
+  管理员只能读；注册与删除都由服务在高完整性校验通过后执行。
+- **哈希强制**。条目没有有效的 `Sha256` 即视为未授权；注册时调用方还要提交预期哈希，
+  服务端独立重算并比对，不一致就拒绝写入。
 - **服务不提权**。它复制的是调用者自己的令牌，完整性级别保持不变；UIAccess 只影响窗口
   层级、前台激活与 UIPI 相关行为，不改变进程的完整性级别。
 - **管道 ACL**：`SYSTEM` / `Administrators` 完全控制，`INTERACTIVE` 仅可读写（用于本地

@@ -44,17 +44,42 @@ inline std::wstring FormatWin32Error(DWORD code) {
     return text + prefix;
 }
 
+// Reads the mandatory integrity level RID of a token (0x2000 medium, 0x3000 high,
+// 0x4000 system). TokenElevation is unreliable on duplicated/impersonation
+// tokens, so elevation decisions use the integrity level instead.
+inline bool IntegrityLevelRid(HANDLE token, DWORD& rid) {
+    DWORD size = 0;
+    GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &size);
+    if (size == 0) {
+        return false;
+    }
+
+    std::vector<BYTE> buffer(size);
+    if (!GetTokenInformation(token, TokenIntegrityLevel, buffer.data(), size, &size)) {
+        return false;
+    }
+
+    const auto* label = reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(buffer.data());
+    const UCHAR subAuthorityCount = *GetSidSubAuthorityCount(label->Label.Sid);
+    if (subAuthorityCount == 0) {
+        return false;
+    }
+    rid = *GetSidSubAuthority(label->Label.Sid, subAuthorityCount - 1);
+    return true;
+}
+
+inline bool IsHighIntegrityToken(HANDLE token) {
+    DWORD rid = 0;
+    return IntegrityLevelRid(token, rid) && rid >= SECURITY_MANDATORY_HIGH_RID;
+}
+
 inline bool IsElevated() {
     HANDLE rawToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) {
         return false;
     }
     UniqueHandle token(rawToken);
-
-    TOKEN_ELEVATION elevation{};
-    DWORD returned = 0;
-    const BOOL ok = GetTokenInformation(token.get(), TokenElevation, &elevation, sizeof(elevation), &returned);
-    return ok != FALSE && elevation.TokenIsElevated != 0;
+    return IsHighIntegrityToken(token.get());
 }
 
 inline bool EqualsIgnoreCase(std::wstring_view left, std::wstring_view right) {

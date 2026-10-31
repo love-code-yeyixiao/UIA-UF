@@ -6,6 +6,27 @@
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 
+## [Unreleased]
+
+### Changed
+
+- 白名单 `Sha256` 改为**强制项**：缺少有效哈希的条目一律按未授权处理，不再接受"只绑路径"。
+- 注册白名单必须提交**预期哈希**：CLI 本地计算并随请求发送，服务端独立重算并比对，
+  不一致直接拒绝；最终写入注册表的是服务端算出的哈希。
+- 白名单的增删改全部改走命名管道，由服务（LocalSystem）执行，CLI 不再直接写注册表。
+- `uiauf check` 改为显示令牌完整性级别（`TokenElevation` 在复制/模拟令牌上不可靠）。
+- 协议版本升到 2：新增 `AllowAdd` / `AllowRemove` / `AllowList` / `AllowResult` / `AllowListResult`。
+
+### Security
+
+- `HKLM\SOFTWARE\UIA-UF` 与 `...\Allow` 的属主改为 `SYSTEM`，DACL 受保护、仅 SYSTEM 可写，
+  Administrators 只读；服务启动时自动收紧已存在的键。
+- 关闭"哈希校验"与"启动"之间的 TOCTOU 窗口：校验句柄改为 `FILE_SHARE_READ` 并持有到
+  `CreateProcessAsUser` 返回；进程以 `CREATE_SUSPENDED` 创建，比对实际映射映像的文件 ID
+  （卷序列号 + file index）通过后才 `ResumeThread`，不一致则终止进程。
+- 白名单条目改为写入解析后的最终路径，修正 `allow add` 与服务端比对口径不一致导致的
+  "加了却用不了"（失败关闭，非绕过）。
+
 ## [0.1.0] - 2026-10-30
 
 首个可运行的 MVP：SYSTEM 服务 + 命令行启动器 + 白名单。
@@ -31,8 +52,3 @@
 - 白名单位于 HKLM，仅管理员可扩大授权范围；管道 ACL 对交互用户只开放读写。
 - 该实现绕过 Windows 对 UIAccess 的 Authenticode 签名与安全路径校验，属于非受支持的配置，
   请只在自有软件上使用。
-- 关闭"哈希校验"与"启动"之间的 TOCTOU 窗口：校验句柄改为 `FILE_SHARE_READ` 并持有到
-  `CreateProcessAsUser` 返回；进程以 `CREATE_SUSPENDED` 创建，比对实际映射映像的文件 ID
-  （卷序列号 + file index）通过后才 `ResumeThread`，不一致则终止进程。
-- 白名单条目改为写入解析后的最终路径，修正 `allow add` 与服务端比对口径不一致导致的
-  "加了却用不了"（失败关闭，非绕过）。

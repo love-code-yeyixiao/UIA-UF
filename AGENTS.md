@@ -75,15 +75,20 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 /permissive- /I src /DUNICODE /D_UNICODE 
 ## 安全契约（不要破坏）
 
 1. **白名单是唯一授权来源。** 服务绝不能启动未经 `ResolveAllowedExecutable` 批准的二进制。
-2. **不提权。** 只能复制调用者自己的令牌，不得修改完整性级别、不得跨会话取令牌。
-3. **按最终路径校验，并在启动时再次钉住映像。** 用 `GetFinalPathNameByHandleW` 消除短文件名 /
+2. **哈希强制。** 条目缺少有效 `Sha256` 一律按未授权处理；注册必须由调用方提交预期哈希，
+   服务端重算比对后才写入，且写入的是服务端算出的值。
+3. **白名单只能经服务修改。** 键的 ACL 仅 SYSTEM 可写，`allow add/remove` 必须走管道；
+   服务侧要校验调用者为高完整性且属于 Administrators，不要给 CLI 直接写注册表的口子。
+4. **不提权。** 只能复制调用者自己的令牌，不得修改完整性级别、不得跨会话取令牌。
+5. **按最终路径校验，并在启动时再次钉住映像。** 用 `GetFinalPathNameByHandleW` 消除短文件名 /
    目录联接；校验用的句柄必须以 `FILE_SHARE_READ` 持有到 `CreateProcessAsUser` 返回，进程必须以
    `CREATE_SUSPENDED` 创建，比对实际映射映像的文件 ID（卷序列号 + file index）后才能 `ResumeThread`。
    不要把这些环节"简化"成先关句柄、再按路径启动。
-4. **管道 ACL 不放宽。** `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`，只允许交互用户读写，
+6. **管道 ACL 不放宽。** `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`，只允许交互用户读写，
    不要加 `WD`、`AN` 或 `Everyone`。
-5. **CLI 保持 `asInvoker`。** 不请求管理员清单、不自动提权；需要管理员的操作只打印提示。
-6. **不记录敏感信息。** 日志里只写调用者账号、最终路径、PID 与错误码。
+7. **CLI 保持 `asInvoker`。** 不请求管理员清单、不自动提权；需要管理员的操作由服务端
+   校验后拒绝，并返回明确错误。
+8. **不记录敏感信息。** 日志里只写调用者账号、最终路径、PID 与错误码。
 
 ## 代码约定
 
@@ -106,13 +111,20 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 /permissive- /I src /DUNICODE /D_UNICODE 
 ## 白名单与数据
 
 ```
-HKLM\SOFTWARE\UIA-UF\Allow\<条目名>
-    Path   (REG_SZ)        必填，可执行文件完整路径
-    Sha256 (REG_SZ, 可选)  64 位小写十六进制；缺省表示不校验
+HKLM\SOFTWARE\UIA-UF\Allow\<条目名>      属主 SYSTEM，受保护 DACL，仅 SYSTEM 可写（BA 只读）
+    Path   (REG_SZ)        必填，可执行文件的最终路径
+    Sha256 (REG_SZ)        必填，64 位十六进制；缺失即视为未授权
 %ProgramData%\UIA-UF\service.log   UTF-16LE，带 BOM
 ```
 
-注册表读写需带 `KEY_WOW64_64KEY`，避免 WOW64 重定向。
+- 注册表读写需带 `KEY_WOW64_64KEY`，避免 WOW64 重定向。
+- 键的 ACL 由服务在启动时通过 `EnsureAllowListKey` 收紧（`SeRestorePrivilege` 改属主），
+  **管理员不能再直接写**；`allow add/remove` 走管道交给服务执行，服务侧要求调用者是
+  高完整性的 Administrators 成员。
+- "预期哈希"不是信任来源：调用方提交的哈希只用于和服务端重算的结果比对，写入注册表的是
+  服务端算出的值。这样"释放文件 → 登记"之间被换文件会注册失败，而不是被静默登记。
+- 本地管理员理论上仍可夺取属主后改写该键——ACL 收紧提高的是门槛，不是对本地管理员的
+  权限边界，不要把这条当成防提权保证。
 
 ## 验证清单
 
@@ -120,7 +132,8 @@ HKLM\SOFTWARE\UIA-UF\Allow\<条目名>
 
 ```powershell
 .\UIA-UF.Service.exe --install
-.\uiauf.exe allow add "C:\Windows\System32\notepad.exe" --hash
+.\uiauf.exe allow add "C:\Windows\System32\notepad.exe"
+.\uiauf.exe allow list               # Sha256 一列必须有值
 .\uiauf.exe ping
 .\uiauf.exe run C:\Windows\System32\notepad.exe
 .\uiauf.exe check <PID>            # 期望 UIAccess = yes, Elevated 与调用者一致
@@ -128,8 +141,9 @@ HKLM\SOFTWARE\UIA-UF\Allow\<条目名>
 .\UIA-UF.Service.exe --uninstall
 ```
 
-同时确认：未在白名单中的程序被拒绝；篡改哈希后被拒绝；**在服务运行期间把目标文件换成另一个 exe
-后被拒绝**（`CreateProcessAsUser` 前替换应因共享冲突打开失败，之后替换应被映像 ID 校验拦下）；
+同时确认：未在白名单中的程序被拒绝；篡改哈希后被拒绝；**手工删掉某个条目的 `Sha256` 后该程序
+被拒绝**（失败关闭）；**在服务运行期间把目标文件换成另一个 exe 后被拒绝**
+（`CreateProcessAsUser` 前替换应因共享冲突打开失败，之后替换应被映像 ID 校验拦下）；
 `--uninstall` 后管道不再存在。
 
 ## 文档与版本

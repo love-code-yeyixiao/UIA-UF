@@ -45,15 +45,18 @@ void SetResultMessage(OperationResult& result, const std::wstring& text) {
     wcsncpy_s(result.message, _countof(result.message), text.c_str(), _TRUNCATE);
 }
 
-// Checks that the caller's token is an elevated member of Administrators.
+// Checks that the caller's token is a high integrity member of Administrators.
 bool IsElevatedAdministratorToken(HANDLE token, DWORD& error) {
-    DWORD returned = 0;
-    TOKEN_ELEVATION elevation{};
-    if (!GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &returned)) {
+    DWORD rid = 0;
+    if (!IntegrityLevelRid(token, rid)) {
         error = GetLastError();
+        LogLine(L"读取调用者完整性级别失败" + FormatWin32Error(error));
         return false;
     }
-    if (!elevation.TokenIsElevated) {
+    if (rid < SECURITY_MANDATORY_HIGH_RID) {
+        wchar_t text[96]{};
+        swprintf_s(text, L"调用者完整性级别不足：%lu (0x%lx)", rid, rid);
+        LogLine(text);
         error = ERROR_ACCESS_DENIED;
         return false;
     }
@@ -63,6 +66,7 @@ bool IsElevatedAdministratorToken(HANDLE token, DWORD& error) {
     if (!AllocateAndInitializeSid(&authority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0,
                                   0, 0, 0, &administrators)) {
         error = GetLastError();
+        LogLine(L"构建 Administrators SID 失败" + FormatWin32Error(error));
         return false;
     }
 
@@ -72,9 +76,11 @@ bool IsElevatedAdministratorToken(HANDLE token, DWORD& error) {
 
     if (!checked) {
         error = GetLastError();
+        LogLine(L"CheckTokenMembership 失败" + FormatWin32Error(error));
         return false;
     }
     if (!member) {
+        LogLine(L"调用者不属于 Administrators。");
         error = ERROR_ACCESS_DENIED;
         return false;
     }

@@ -225,13 +225,12 @@ int CheckCommand(const std::vector<std::wstring>& positional) {
                                                  &returned) != FALSE &&
                              uiAccess != 0;
 
-    TOKEN_ELEVATION elevation{};
-    const bool elevated = GetTokenInformation(token.get(), TokenElevation, &elevation, sizeof(elevation),
-                                              &returned) != FALSE &&
-                          elevation.TokenIsElevated != 0;
+    DWORD rid = 0;
+    const bool haveRid = uiauf::IntegrityLevelRid(token.get(), rid);
+    const bool elevated = haveRid && rid >= SECURITY_MANDATORY_HIGH_RID;
 
-    std::wprintf(L"PID %lu: UIAccess = %ls, Elevated = %ls\n", pid, hasUiAccess ? L"yes" : L"no",
-                 elevated ? L"yes" : L"no");
+    std::wprintf(L"PID %lu: UIAccess = %ls, Elevated = %ls (IL 0x%lx)\n", pid,
+                 hasUiAccess ? L"yes" : L"no", elevated ? L"yes" : L"no", rid);
     return hasUiAccess ? 0 : 1;
 }
 
@@ -344,10 +343,6 @@ int AllowAddCommand(const std::vector<std::wstring>& positional) {
         std::fwprintf(stderr, L"allow add: 缺少文件路径。\n");
         return 2;
     }
-    if (!uiauf::IsElevated()) {
-        std::fwprintf(stderr, L"allow add: 需要在管理员终端中运行。\n");
-        return 5;
-    }
 
     const std::wstring path = ResolveFinalPath(ToFullPath(positional[2]));
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -371,10 +366,6 @@ int AllowRemoveCommand(const std::vector<std::wstring>& positional) {
     if (positional.size() < 3) {
         std::fwprintf(stderr, L"allow remove: 缺少条目名称。\n");
         return 2;
-    }
-    if (!uiauf::IsElevated()) {
-        std::fwprintf(stderr, L"allow remove: 需要在管理员终端中运行。\n");
-        return 5;
     }
 
     return SendAllowRequest(L"删除白名单条目", uiauf::MessageType::AllowRemove,
