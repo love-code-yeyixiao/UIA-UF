@@ -33,8 +33,9 @@ void PrintUsage() {
                   L"  uiauf check <PID>                          查看进程是否具有 UIAccess\n"
                   L"  uiauf ping                                 检查服务是否在线\n"
                   L"  uiauf allow list                           列出白名单\n"
-                  L"  uiauf allow add <文件>                     注册白名单条目（管理员，自动锁定哈希）\n"
+                  L"  uiauf allow add <文件> --sha256 <哈希>      注册白名单条目（管理员）\n"
                   L"  uiauf allow remove <名称>                  删除白名单条目（管理员）\n"
+                  L"  uiauf hash <文件>                          计算文件的 SHA-256\n"
                   L"  uiauf notify --title <标题> --message <正文>  发送一条通知（供服务调用）\n"
                   L"  uiauf help                                 显示本帮助\n"
                   L"\n"
@@ -43,8 +44,8 @@ void PrintUsage() {
                   L"  Path   (REG_SZ)       可执行文件最终路径\n"
                   L"  Sha256 (REG_SZ)       强制项，必须与文件内容一致\n"
                   L"\n"
-                  L"条目名称取文件名（不含扩展名）。注册时会同时提交预期哈希，服务端重新计算并比对，\n"
-                  L"不一致则拒绝写入。--hash 参数保留兼容，现已默认启用。\n");
+                  L"add 必须由调用方提交预期哈希（--sha256），服务端会独立重算并比对，\n"
+                  L"不一致则拒绝写入。安装程序应当传入自己在释放文件时记录的哈希。\n");
 }
 
 std::wstring ToFullPath(const std::wstring& path) {
@@ -105,7 +106,122 @@ UniqueHandle ConnectToService(DWORD& error) {
     return {};
 }
 
+struct ScHandleCloser {
+    void operator()(SC_HANDLE handle) const noexcept {
+        if (handle != nullptr) {
+            CloseServiceHandle(handle);
+        }
+    }
+};
+
+using UniqueScHandle = std::unique_ptr<std::remove_pointer_t<SC_HANDLE>, ScHandleCloser>;
+
+enum class ServiceState { Unknown, Disabled, Running };
+
+ServiceState QueryServiceState() {
+    UniqueScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm) {
+        return ServiceState::Unknown;
+    }
+
+    UniqueScHandle service(OpenServiceW(scm.get(), uiauf::kServiceName, SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS));
+    if (!service) {
+        return ServiceState::Unknown;
+    }
+
+    DWORD needed = 0;
+    QueryServiceConfigW(service.get(), nullptr, 0, &needed);
+    if (needed == 0) {
+        return ServiceState::Unknown;
+    }
+
+    std::vector<BYTE> buffer(needed);
+    auto* config = reinterpret_cast<LPQUERY_SERVICE_CONFIGW>(buffer.data());
+    if (!QueryServiceConfigW(service.get(), config, needed, &needed)) {
+        return ServiceState::Unknown;
+    }
+
+    return config->dwStartType == SERVICE_DISABLED ? ServiceState::Disabled : ServiceState::Running;
+}
+
+bool AutoDisabledMarkerExists() {
+    ULONGLONG value = 0;
+    DWORD bytes = sizeof(value);
+    return RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\UIA-UF\\Setup", L"AutoDisabledAt",
+                        RRF_RT_REG_QWORD, nullptr, &value, &bytes) == ERROR_SUCCESS;
+}
+
+bool ShouldShowDisabledNotice() {
+    ULONGLONG last = 0;
+    DWORD bytes = sizeof(last);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\UIA-UF", L"LastDisabledNotice", RRF_RT_REG_QWORD,
+                     nullptr, &last, &bytes) == ERROR_SUCCESS) {
+        const ULONGLONG now = uiauf::NowFileTime();
+        constexpr ULONGLONG kDay = 24ull * 60ull * 60ull * 10000000ull;
+        if (now >= last && now - last < kDay) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MarkDisabledNoticeShown() {
+    const ULONGLONG now = uiauf::NowFileTime();
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\UIA-UF", L"LastDisabledNotice", REG_QWORD, &now,
+                    sizeof(now));
+}
+
+// Runs `uiauf notify ...` as a detached child so the caller does not have to wait
+// for the notification to be rendered.
+void ShowNotificationDetached(const std::wstring& title, const std::wstring& message) {
+    wchar_t module[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, module, static_cast<DWORD>(std::size(module)));
+    if (length == 0 || length >= std::size(module)) {
+        return;
+    }
+
+    const std::wstring commandLine = uiauf::QuoteArgument(module) + L" notify --title " +
+                                     uiauf::QuoteArgument(title) + L" --message " +
+                                     uiauf::QuoteArgument(message);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    // DETACHED_PROCESS keeps the notifier from inheriting our console (and with
+    // it, any redirected stdout handle the caller may be waiting on).
+    if (CreateProcessW(module, const_cast<LPWSTR>(commandLine.c_str()), nullptr, nullptr, FALSE,
+                       DETACHED_PROCESS, nullptr, nullptr, &startup, &child)) {
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+    }
+}
+
 int ReportServiceUnavailable(DWORD error) {
+    if (QueryServiceState() == ServiceState::Disabled) {
+        const bool autoDisabled = AutoDisabledMarkerExists();
+
+        if (autoDisabled && ShouldShowDisabledNotice()) {
+            ShowNotificationDetached(
+                L"UIA-UF 已自动禁用",
+                L"UIA-UF 因长期闲置已被自动禁用。如果用不到，建议卸载：UIA-UF.Service.exe --uninstall；"
+                L"如需继续使用，请以管理员运行 UIA-UF.Service.exe --install。");
+            MarkDisabledNoticeShown();
+        }
+
+        if (autoDisabled) {
+            std::fwprintf(stderr,
+                          L"UIA-UF 服务因长期闲置已被自动禁用（%ls）。\n"
+                          L"  恢复：以管理员运行 UIA-UF.Service.exe --install\n"
+                          L"  卸载：以管理员运行 UIA-UF.Service.exe --uninstall\n",
+                          uiauf::FormatWin32Error(error).c_str());
+        } else {
+            std::fwprintf(stderr,
+                          L"UIA-UF 服务已被禁用。\n"
+                          L"  恢复：以管理员运行 UIA-UF.Service.exe --install\n");
+        }
+        return 3;
+    }
+
     std::fwprintf(stderr,
                   L"无法连接到 UIA-UF 服务 (%ls)。\n"
                   L"请确认服务已安装并正在运行：\n"
@@ -344,9 +460,21 @@ int AllowListCommand() {
     return 0;
 }
 
-int AllowAddCommand(const std::vector<std::wstring>& positional) {
+int AllowAddCommand(const std::vector<std::wstring>& positional, const std::wstring& expectedSha256) {
     if (positional.size() < 3) {
         std::fwprintf(stderr, L"allow add: 缺少文件路径。\n");
+        return 2;
+    }
+
+    if (expectedSha256.empty()) {
+        std::fwprintf(stderr,
+                      L"allow add: 缺少 --sha256 <64 位十六进制>。\n"
+                      L"  预期哈希必须由调用方提供，例如安装程序在释放文件时记录的值；\n"
+                      L"  人工操作可以先用 `uiauf hash <文件>` 取得。\n");
+        return 2;
+    }
+    if (!uiauf::IsSha256Hex(expectedSha256)) {
+        std::fwprintf(stderr, L"allow add: --sha256 必须是 64 位十六进制。\n");
         return 2;
     }
 
@@ -356,6 +484,18 @@ int AllowAddCommand(const std::vector<std::wstring>& positional) {
         return 2;
     }
 
+    std::wprintf(L"注册 %ls\n  预期 SHA-256 = %ls\n", path.c_str(), expectedSha256.c_str());
+    return SendAllowRequest(L"注册白名单条目", uiauf::MessageType::AllowAdd,
+                            uiauf::MakeStringPayload({path, expectedSha256}));
+}
+
+int HashCommand(const std::vector<std::wstring>& positional) {
+    if (positional.size() < 2) {
+        std::fwprintf(stderr, L"hash: 缺少文件路径。\n");
+        return 2;
+    }
+
+    const std::wstring path = ToFullPath(positional[1]);
     std::wstring digest;
     DWORD error = ERROR_SUCCESS;
     if (!ReadFileSha256(path, digest, error)) {
@@ -363,9 +503,8 @@ int AllowAddCommand(const std::vector<std::wstring>& positional) {
         return 1;
     }
 
-    std::wprintf(L"注册 %ls\n  预期 SHA-256 = %ls\n", path.c_str(), digest.c_str());
-    return SendAllowRequest(L"注册白名单条目", uiauf::MessageType::AllowAdd,
-                            uiauf::MakeStringPayload({path, digest}));
+    std::wprintf(L"%ls\n", digest.c_str());
+    return 0;
 }
 
 int AllowRemoveCommand(const std::vector<std::wstring>& positional) {
@@ -411,6 +550,7 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring_view command = argv[1];
     std::vector<std::wstring> positional;
     bool waitForExit = false;
+    std::wstring expectedSha256;
 
     if (command == L"notify") {
         return NotifyCommand(argc, argv);
@@ -421,8 +561,10 @@ int wmain(int argc, wchar_t** argv) {
             waitForExit = true;
             continue;
         }
-        if (std::wcscmp(argv[i], L"--hash") == 0) {
-            // Kept for compatibility: hashing is mandatory now.
+        if (std::wcscmp(argv[i], L"--sha256") == 0) {
+            if (i + 1 < argc) {
+                expectedSha256 = argv[++i];
+            }
             continue;
         }
         positional.emplace_back(argv[i]);
@@ -437,6 +579,9 @@ int wmain(int argc, wchar_t** argv) {
     if (command == L"ping") {
         return PingCommand();
     }
+    if (command == L"hash") {
+        return HashCommand(positional);
+    }
     if (command == L"allow") {
         if (positional.size() < 2) {
             PrintUsage();
@@ -446,7 +591,7 @@ int wmain(int argc, wchar_t** argv) {
             return AllowListCommand();
         }
         if (positional[1] == L"add") {
-            return AllowAddCommand(positional);
+            return AllowAddCommand(positional, expectedSha256);
         }
         if (positional[1] == L"remove" || positional[1] == L"delete") {
             return AllowRemoveCommand(positional);

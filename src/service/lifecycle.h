@@ -14,9 +14,11 @@ namespace uiauf {
 // it is persisted so later SCM starts keep the same policy.
 DWORD EnsureSetupRegistration(const wchar_t* setupMode, std::wstring& message);
 
-// Evaluates the idle/unused policy for a user session and, when it applies,
-// asks the registered client to show a warning notification in that session.
-// Safe to call repeatedly; it only acts once per warning period.
-void EvaluateIdlePolicy(DWORD sessionId);
+// Evaluates the idle/unused policy for a user session. `sessionId` may be 0
+// when no interactive session is available: the warning then cannot be shown
+// (and the grace clock is not started), but an already warned installation can
+// still reach the auto-disable step. `stopEvent` is signalled after the service
+// disables itself so ServiceMain can shut down cleanly.
+void EvaluateIdlePolicy(DWORD sessionId, HANDLE stopEvent);
 
 } // namespace uiauf

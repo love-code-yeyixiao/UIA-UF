@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common/hash.h"
+#include "common/protocol.h"
 #include "common/win32_helpers.h"
 #include "service/allowlist.h"
 #include "service/log.h"
@@ -18,8 +19,8 @@ constexpr wchar_t kSetupKey[] = L"SOFTWARE\\UIA-UF\\Setup";
 
 // 100 ns units, one day.
 constexpr ULONGLONG kDay = 24ull * 60ull * 60ull * 10000000ull;
-constexpr ULONGLONG kIdlePeriod = 15ull * kDay;
-constexpr ULONGLONG kWarningGrace = 15ull * kDay;
+constexpr ULONGLONG kDefaultIdleDays = 15;
+constexpr ULONGLONG kDefaultWarnDays = 15;
 
 struct RegKeyCloser {
     void operator()(HKEY key) const noexcept {
@@ -72,6 +73,13 @@ bool ReadQword(HKEY key, const wchar_t* name, ULONGLONG& value) {
 bool ReadDword(HKEY key, const wchar_t* name, DWORD& value) {
     DWORD bytes = sizeof(value);
     return RegGetValueW(key, nullptr, name, RRF_RT_REG_DWORD, nullptr, &value, &bytes) == ERROR_SUCCESS;
+}
+
+// Policy thresholds are overridable through the SYSTEM-only Setup key; tests and
+// integrators use that to shorten the 15 day periods.
+ULONGLONG ReadDays(HKEY key, const wchar_t* name, ULONGLONG fallback) {
+    DWORD value = 0;
+    return ReadDword(key, name, value) ? value : fallback;
 }
 
 void WriteQword(const wchar_t* name, ULONGLONG value) {
@@ -174,23 +182,57 @@ bool VerifyRegisteredClient(HKEY key, std::wstring& clientPath) {
     return EqualsIgnoreCase(actual, expected);
 }
 
-void ShowIdleWarning(DWORD sessionId, const std::wstring& clientPath) {
+bool ShowIdleWarning(DWORD sessionId, const std::wstring& clientPath, const std::wstring& text,
+                     ULONGLONG warnDays) {
     const std::wstring title = L"UIA-UF 闲置提醒";
-    const std::wstring text =
-        L"UIA-UF 已超过 15 天没有可用的白名单条目（为空，或条目指向的程序已不存在）。"
-        L"请在 15 天内添加条目或卸载框架，否则 UIA-UF 将自动卸载。";
-
     const std::wstring arguments =
         L"notify --title " + QuoteArgument(title) + L" --message " + QuoteArgument(text);
 
     const DWORD error = LaunchInSession(sessionId, clientPath, arguments);
     if (error != ERROR_SUCCESS) {
         LogError(L"LaunchInSession(notify)", error);
+        return false;
+    }
+
+    LogLine(L"已向会话 " + std::to_wstring(sessionId) + L" 发送闲置提醒（宽限期 " +
+            std::to_wstring(warnDays) + L" 天）。");
+    return true;
+}
+
+// Disables the service in the SCM and asks ServiceMain to stop. Reversible:
+// `--install` puts the start type back to demand start.
+void DisableSelfAndStop(HANDLE stopEvent) {
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (scm == nullptr) {
+        LogError(L"OpenSCManager (auto disable)", GetLastError());
         return;
     }
 
-    WriteQword(L"WarnedAt", NowFileTime());
-    LogLine(L"已向会话 " + std::to_wstring(sessionId) + L" 发送闲置提醒。");
+    SC_HANDLE service = OpenServiceW(scm, kServiceName, SERVICE_CHANGE_CONFIG);
+    if (service == nullptr) {
+        LogError(L"OpenService (auto disable)", GetLastError());
+        CloseServiceHandle(scm);
+        return;
+    }
+
+    const BOOL changed = ChangeServiceConfigW(service, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE,
+                                              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    const DWORD error = changed ? ERROR_SUCCESS : GetLastError();
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+
+    if (error != ERROR_SUCCESS) {
+        LogError(L"ChangeServiceConfig(SERVICE_DISABLED)", error);
+        return;
+    }
+
+    WriteQword(L"AutoDisabledAt", NowFileTime());
+    LogLine(L"闲置宽限期已过且仍无可用条目，服务已在 SCM 中被自动禁用（可用 --install 恢复）。");
+
+    if (stopEvent != nullptr) {
+        SetEvent(stopEvent);
+    }
 }
 
 } // namespace
@@ -213,6 +255,16 @@ DWORD EnsureSetupRegistration(const wchar_t* setupMode, std::wstring& message) {
                         sizeof(standalone));
         LogLine(standalone != 0 ? L"安装模式：独立安装（跳过闲置清理检查）"
                                 : L"安装模式：捆绑安装（启用闲置清理检查）");
+
+        // Coming back from an automatic disable is an explicit "I still want
+        // this" signal: start a fresh warning cycle instead of disabling again
+        // on the next evaluation.
+        ULONGLONG autoDisabledAt = 0;
+        if (ReadQword(key.get(), L"AutoDisabledAt", autoDisabledAt)) {
+            RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kSetupKey, L"WarnedAt");
+            RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kSetupKey, L"AutoDisabledAt");
+            LogLine(L"已从自动禁用状态恢复，闲置提醒重新计时。");
+        }
     }
 
     ULONGLONG installedAt = 0;
@@ -233,9 +285,7 @@ DWORD EnsureSetupRegistration(const wchar_t* setupMode, std::wstring& message) {
 
         WriteString(L"ClientPath", clientPath);
         WriteString(L"ClientSha256", digest);
-        RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kSetupKey, L"WarnedAt");
-        // Legacy value from an earlier build: the idle clock is now kept on the
-        // allow list key itself (see Allow\LastChanged).
+        // Legacy values from earlier builds.
         RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kSetupKey, L"ClientLastWrite");
 
         LogLine(L"已登记客户端：" + clientPath);
@@ -245,11 +295,7 @@ DWORD EnsureSetupRegistration(const wchar_t* setupMode, std::wstring& message) {
     return ERROR_SUCCESS;
 }
 
-void EvaluateIdlePolicy(DWORD sessionId) {
-    if (sessionId == 0 || sessionId == 0xFFFFFFFF) {
-        return;
-    }
-
+void EvaluateIdlePolicy(DWORD sessionId, HANDLE stopEvent) {
     UniqueRegKey key = OpenSetupKey(KEY_ALL_ACCESS);
     if (!key) {
         return;
@@ -259,6 +305,9 @@ void EvaluateIdlePolicy(DWORD sessionId) {
     if (ReadDword(key.get(), L"Standalone", standalone) && standalone != 0) {
         return;
     }
+
+    const ULONGLONG idleDays = ReadDays(key.get(), L"IdleDays", kDefaultIdleDays);
+    const ULONGLONG warnDays = ReadDays(key.get(), L"WarnDays", kDefaultWarnDays);
 
     const ULONGLONG now = NowFileTime();
     ULONGLONG warnedAt = 0;
@@ -274,12 +323,17 @@ void EvaluateIdlePolicy(DWORD sessionId) {
     }
 
     if (warned) {
-        if (now >= warnedAt && now - warnedAt < kWarningGrace) {
+        if (now >= warnedAt && now - warnedAt < warnDays * kDay) {
             return;
         }
-        // Grace period after the warning has elapsed. The destructive step is
-        // deliberately not wired yet: it needs an explicit policy decision.
-        LogLine(L"闲置宽限期已结束且仍无可用条目，自动卸载尚未启用（需人工处理）。");
+        // Grace period elapsed: stop serving, but stay installed and reversible.
+        DisableSelfAndStop(stopEvent);
+        return;
+    }
+
+    // Without an interactive session the warning cannot be shown, and the grace
+    // clock must not start silently behind the user's back.
+    if (sessionId == 0 || sessionId == 0xFFFFFFFF) {
         return;
     }
 
@@ -289,7 +343,7 @@ void EvaluateIdlePolicy(DWORD sessionId) {
     if (!ReadAllowListChangedAt(changedAt) && !ReadQword(key.get(), L"InstalledAt", changedAt)) {
         return;
     }
-    if (now < changedAt || now - changedAt < kIdlePeriod) {
+    if (now < changedAt || now - changedAt < idleDays * kDay) {
         return;
     }
 
@@ -299,7 +353,14 @@ void EvaluateIdlePolicy(DWORD sessionId) {
         return;
     }
 
-    ShowIdleWarning(sessionId, clientPath);
+    const std::wstring text = L"UIA-UF 已超过 " + std::to_wstring(idleDays) +
+                              L" 天没有可用的白名单条目（为空，或条目指向的程序已不存在）。请在 " +
+                              std::to_wstring(warnDays) +
+                              L" 天内添加条目或卸载框架，否则服务将被自动禁用。";
+
+    if (ShowIdleWarning(sessionId, clientPath, text, warnDays)) {
+        WriteQword(L"WarnedAt", now);
+    }
 }
 
 } // namespace uiauf

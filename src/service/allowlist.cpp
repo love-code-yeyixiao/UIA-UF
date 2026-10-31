@@ -74,17 +74,7 @@ std::wstring BaseNameOf(const std::wstring& path) {
 }
 
 bool IsSha256(const std::wstring& text) {
-    if (text.size() != 64) {
-        return false;
-    }
-    for (const wchar_t character : text) {
-        const bool hex = (character >= L'0' && character <= L'9') || (character >= L'a' && character <= L'f') ||
-                         (character >= L'A' && character <= L'F');
-        if (!hex) {
-            return false;
-        }
-    }
-    return true;
+    return IsSha256Hex(text);
 }
 
 std::wstring ReadStringValue(HKEY key, const wchar_t* valueName) {

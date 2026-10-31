@@ -136,9 +136,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv) {
 
     std::thread lifecycle([&server] {
         const DWORD consoleSession = WTSGetActiveConsoleSessionId();
-        if (consoleSession != 0xFFFFFFFF) {
-            EvaluateIdlePolicy(consoleSession);
-        }
+        EvaluateIdlePolicy(consoleSession == 0xFFFFFFFF ? 0 : consoleSession, server.StopEvent());
 
         for (;;) {
             const HANDLE waits[] = {server.StopEvent(), g_sessionEvent};
@@ -147,7 +145,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv) {
                 break;
             }
             if (wait == WAIT_OBJECT_0 + 1) {
-                EvaluateIdlePolicy(g_pendingSession.load());
+                EvaluateIdlePolicy(g_pendingSession.load(), server.StopEvent());
             }
         }
     });
@@ -191,12 +189,13 @@ DWORD InstallService() {
         if (error != ERROR_SERVICE_EXISTS) {
             return error;
         }
-        // Already installed: refresh the binary path so the service follows the build output.
+        // Already installed: refresh the binary path and make sure a service that
+        // was auto-disabled by the idle policy is startable again.
         service.reset(OpenServiceW(scm.get(), kServiceName, SERVICE_ALL_ACCESS));
         if (!service) {
             return GetLastError();
         }
-        if (!ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+        if (!ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE, SERVICE_DEMAND_START, SERVICE_NO_CHANGE,
                                   imagePath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr,
                                   nullptr)) {
             return GetLastError();
@@ -295,9 +294,6 @@ int RunInConsole() {
     EnsureSetupRegistration(nullptr, setupMessage);
 
     const DWORD consoleSession = WTSGetActiveConsoleSessionId();
-    if (consoleSession != 0xFFFFFFFF) {
-        EvaluateIdlePolicy(consoleSession);
-    }
 
     ServiceServer server;
     g_server = &server;
@@ -306,6 +302,8 @@ int RunInConsole() {
         wprintf(L"服务端启动失败，详见 %%ProgramData%%\\UIA-UF\\service.log。\n");
         return 1;
     }
+
+    EvaluateIdlePolicy(consoleSession == 0xFFFFFFFF ? 0 : consoleSession, server.StopEvent());
 
     SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
     WaitForSingleObject(server.StopEvent(), INFINITE);

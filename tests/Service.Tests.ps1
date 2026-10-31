@@ -40,8 +40,19 @@ try {
         Assert-Match $result.Output 'PID' 'ping 输出异常'
     }
 
+    Test '错误的预期哈希被拒绝' {
+        $wrong = '0' * 64
+        $result = Invoke-Tool $cli @('allow', 'add', $demo, '--sha256', $wrong)
+        Assert-Equal 1 $result.ExitCode '错误哈希不应注册成功'
+        Assert-Match $result.Output '不一致' '拒绝原因应为哈希不一致'
+    }
+
     Test '注册白名单条目' {
-        $result = Invoke-Tool $cli @('allow', 'add', $demo)
+        $hashResult = Invoke-Tool $cli @('hash', $demo)
+        Assert-Equal 0 $hashResult.ExitCode ("计算哈希失败：" + $hashResult.Output)
+        $digest = $hashResult.Output.Trim()
+
+        $result = Invoke-Tool $cli @('allow', 'add', $demo, '--sha256', $digest)
         Assert-Equal 0 $result.ExitCode ("注册失败：" + $result.Output)
     }
 
@@ -101,4 +112,55 @@ finally {
     }
     Invoke-Tool $service @('--uninstall') | Out-Null
     Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# 闲置策略：到点自动禁用（只禁用 SCM 启动类型，不删除任何东西）
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '  -- 闲置策略 --' -ForegroundColor Cyan
+
+try {
+    # 预置状态：白名单为空且 20 天没动过，并且已经提醒过 20 天。
+    # 这样第二次评估必然进入"宽限期已过"的分支，不依赖是否有可交互会话。
+    $allow = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\UIA-UF\Allow')
+    $allow.SetValue('LastChanged', [UInt64]([DateTime]::UtcNow.AddDays(-20).ToFileTimeUtc()), 'QWord')
+    $allow.Close()
+    $setup = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\UIA-UF\Setup')
+    $setup.SetValue('WarnedAt', [UInt64]([DateTime]::UtcNow.AddDays(-20).ToFileTimeUtc()), 'QWord')
+    $setup.Close()
+
+    Test '闲置宽限期结束后自动禁用服务' {
+        $result = Invoke-Tool $service @('--install')
+        Assert-Equal 0 $result.ExitCode ("安装失败：" + $result.Output)
+
+        $disabled = $false
+        for ($attempt = 0; $attempt -lt 50 -and -not $disabled; $attempt++) {
+            Start-Sleep -Milliseconds 200
+            $current = Get-Service -Name 'UIA-UF' -ErrorAction SilentlyContinue
+            $disabled = ($null -ne $current) -and ($current.StartType -eq 'Disabled')
+        }
+        Assert-True $disabled '服务没有被自动禁用'
+
+        $marker = Get-ItemProperty 'HKLM:\SOFTWARE\UIA-UF\Setup' -Name 'AutoDisabledAt' -ErrorAction SilentlyContinue
+        Assert-True ($null -ne $marker) '缺少 AutoDisabledAt 标记'
+    }
+
+    Test '禁用后 CLI 提示已自动禁用' {
+        $result = Invoke-Tool $cli @('ping')
+        Assert-Equal 3 $result.ExitCode '服务被禁用时 ping 应返回 3'
+        Assert-Match $result.Output '禁用' '提示中没有说明服务已被禁用'
+    }
+
+    Test '重新安装可恢复启用' {
+        $result = Invoke-Tool $service @('--install')
+        Assert-Equal 0 $result.ExitCode ("恢复失败：" + $result.Output)
+
+        $ping = Invoke-Tool $cli @('ping')
+        Assert-Equal 0 $ping.ExitCode ("恢复后服务未运行：" + $ping.Output)
+    }
+}
+finally {
+    Invoke-Tool $service @('--uninstall') | Out-Null
+    Remove-Item 'HKLM:\SOFTWARE\UIA-UF' -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -165,8 +165,12 @@ HKLM\SOFTWARE\UIA-UF\Setup               安装登记，仅服务写入
   `InstalledAt`）超过 15 天，且白名单"无可用条目"（为空，或全部条目指向的文件都不存在）
   时才触发——只查存在性，不查哈希，这是卫生检查而不是授权判断。
 - 触发时先校验 `ClientPath` 的哈希，通过才启动 `notify` 通知；不通过只记日志，绝不提醒。
-- 提醒后再过 15 天仍未处理，目前**只记录日志**。自动卸载是破坏性动作（停服务、删服务、
-  删注册表、删二进制），必须先明确范围、失败回滚和误判处理，不能顺手加进来。
+- 提醒后再过 15 天仍未处理，服务会把自己的 SCM 启动类型改为 `DISABLED` 并停止。
+  **这是有意的非破坏性选择**：不删服务、不删文件、不删注册表，`--install` 即可恢复
+  （恢复时会清除 `WarnedAt`/`AutoDisabledAt`，重新计一轮提醒）。
+- 被禁用期间，CLI 会检测到 `SERVICE_DISABLED` 并提示恢复/卸载方式，每天最多弹一次通知
+  （`HKCU\Software\UIA-UF\LastDisabledNotice` 限流）。
+- 阈值可通过 `Setup\IdleDays` / `Setup\WarnDays`（DWORD，默认 15）调整，测试用它压缩时间。
 - 只要新增了可用条目，`WarnedAt` 会被清除，避免以后再次闲置时反而不再提醒。
 
 ## 验证清单
@@ -175,7 +179,8 @@ HKLM\SOFTWARE\UIA-UF\Setup               安装登记，仅服务写入
 
 ```powershell
 .\UIA-UF.Service.exe --install
-.\uiauf.exe allow add "C:\Windows\System32\notepad.exe"
+$hash = .\uiauf.exe hash "C:\Windows\System32\notepad.exe"
+.\uiauf.exe allow add "C:\Windows\System32\notepad.exe" --sha256 $hash
 .\uiauf.exe allow list               # Sha256 一列必须有值
 .\uiauf.exe ping
 .\uiauf.exe run C:\Windows\System32\notepad.exe

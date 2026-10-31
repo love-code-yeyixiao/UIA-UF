@@ -42,6 +42,28 @@ Test 'allow add 缺少参数返回 2' {
     Assert-Equal 2 $result.ExitCode 'allow add 缺少参数应返回 2'
 }
 
+Test 'allow add 缺少 --sha256 返回 2' {
+    $result = Invoke-Tool $cli @('allow', 'add', $cli)
+    Assert-Equal 2 $result.ExitCode '缺少预期哈希应返回 2'
+    Assert-Match $result.Output 'sha256' '应提示需要 --sha256'
+}
+
+Test 'hash 缺少参数返回 2' {
+    $result = Invoke-Tool $cli @('hash')
+    Assert-Equal 2 $result.ExitCode 'hash 缺少参数应返回 2'
+}
+
+Test 'hash 目标不存在返回 1' {
+    $result = Invoke-Tool $cli @('hash', 'C:\definitely\missing.exe')
+    Assert-Equal 1 $result.ExitCode 'hash 目标不存在应返回 1'
+}
+
+Test 'hash 输出 64 位十六进制' {
+    $result = Invoke-Tool $cli @('hash', $cli)
+    Assert-Equal 0 $result.ExitCode ("hash 失败：" + $result.Output)
+    Assert-Match $result.Output.Trim() '^[0-9a-f]{64}$' 'hash 输出不是 64 位十六进制'
+}
+
 Test 'allow 未知子命令返回 2' {
     $result = Invoke-Tool $cli @('allow', 'frobnicate')
     Assert-Equal 2 $result.ExitCode 'allow 未知子命令应返回 2'

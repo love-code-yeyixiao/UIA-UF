@@ -91,4 +91,20 @@ inline DWORD ComputeSha256Hex(HANDLE file, std::wstring& digest) {
     return status;
 }
 
+// Returns true when the string is exactly 64 hexadecimal characters, i.e. a
+// SHA-256 digest in the form the wire protocol and registry use.
+inline bool IsSha256Hex(std::wstring_view text) {
+    if (text.size() != 64) {
+        return false;
+    }
+    for (const wchar_t character : text) {
+        const bool hex = (character >= L'0' && character <= L'9') || (character >= L'a' && character <= L'f') ||
+                         (character >= L'A' && character <= L'F');
+        if (!hex) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace uiauf

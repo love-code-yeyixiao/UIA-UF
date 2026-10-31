@@ -17,6 +17,10 @@
 - 白名单修改时间：`Allow\LastChanged` 在条目增删时刷新，服务启动不会重置。
 - 闲置清理提醒：白名单超过 15 天未修改、且没有可用条目时，在用户会话登录后校验客户端
   哈希并弹通知；`--install --StandaloneSetup` 可关闭该检查。
+- 闲置宽限期结束后，服务会把自身 SCM 启动类型改为 `DISABLED` 并停止（不卸载、不删文件，
+  `--install` 可恢复）；被禁用期间 CLI 会提示并每天最多弹一次通知。
+- `Setup\IdleDays` / `Setup\WarnDays`（DWORD，默认 15）可调整两个阈值，测试用它压缩时间。
+- 集成测试新增"闲置宽限期结束后自动禁用 / CLI 提示 / 重新安装恢复"三项。
 - `tests/`：基于 PowerShell 的测试（不依赖 Pester），含 CLI 行为测试与服务端集成测试；
   `Run-Tests.ps1 -SkipServiceTests` 可在受限环境只跑 CLI 部分。
 - CI 新增 `tests` 作业：下载 Release 产物后执行完整测试，标签发布依赖它通过。
@@ -28,8 +32,8 @@
 - `--install` 现在会先停止服务再用安装模式参数重新启动，确保 `--StandaloneSetup` 生效。
 - `uiauf check` 对已经退出的 PID 给出明确提示，而不是直接输出 Win32 错误码。
 - 白名单 `Sha256` 改为**强制项**：缺少有效哈希的条目一律按未授权处理，不再接受"只绑路径"。
-- 注册白名单必须提交**预期哈希**：CLI 本地计算并随请求发送，服务端独立重算并比对，
-  不一致直接拒绝；最终写入注册表的是服务端算出的哈希。
+- 注册白名单必须由**调用方**提交预期哈希（`allow add --sha256 <哈希>`）：CLI 不自行计算，
+  服务端独立重算并比对，不一致直接拒绝；最终写入注册表的是服务端算出的哈希。
 - 白名单的增删改全部改走命名管道，由服务（LocalSystem）执行，CLI 不再直接写注册表。
 - `uiauf check` 改为显示令牌完整性级别（`TokenElevation` 在复制/模拟令牌上不可靠）。
 - 协议版本升到 2：新增 `AllowAdd` / `AllowRemove` / `AllowList` / `AllowResult` / `AllowListResult`。
