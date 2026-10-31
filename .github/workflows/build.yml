@@ -71,6 +71,17 @@ jobs:
         shell: pwsh
         run: ./tests/Run-Tests.ps1 -BinDir bin
 
+      - name: Service log on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:ProgramData 'UIA-UF\service.log'
+          if (Test-Path $log) {
+            Get-Content $log -Encoding Unicode
+          } else {
+            Write-Host "未生成 service.log：$log"
+          }
+
   release:
     name: release
     if: startsWith(github.ref, 'refs/tags/v')

@@ -66,6 +66,7 @@ try {
     Test '未登记的程序被拒绝' {
         $result = Invoke-Tool $cli @('run', (Join-Path $env:WINDIR 'System32\notepad.exe'))
         Assert-Equal 1 $result.ExitCode '未登记的程序应被拒绝'
+        Assert-Match $result.Output '不在白名单' '拒绝原因应为"不在白名单"，而不是其他失败'
     }
 
     Test '替换文件后哈希失配被拒绝' {
@@ -78,6 +79,7 @@ try {
         Copy-Item $env:ComSpec $demo -Force
         $result = Invoke-Tool $cli @('run', $demo)
         Assert-Equal 1 $result.ExitCode '文件被替换后仍被放行'
+        Assert-Match $result.Output '哈希' '拒绝原因应为哈希不匹配'
     }
 
     Test '删除白名单条目' {

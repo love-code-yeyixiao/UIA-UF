@@ -45,6 +45,33 @@ void SetResultMessage(OperationResult& result, const std::wstring& text) {
     wcsncpy_s(result.message, _countof(result.message), text.c_str(), _TRUNCATE);
 }
 
+// Checks whether the SID is present in the token's group list *and* enabled.
+// CheckTokenMembership requires an impersonation token when a handle is passed,
+// so the groups are inspected directly; deny-only groups (UAC filtered tokens)
+// do not carry SE_GROUP_ENABLED and are therefore correctly rejected.
+bool TokenIsInEnabledGroup(HANDLE token, PSID sid) {
+    DWORD size = 0;
+    GetTokenInformation(token, TokenGroups, nullptr, 0, &size);
+    if (size == 0) {
+        LogLine(L"读取调用者组信息失败" + FormatWin32Error(GetLastError()));
+        return false;
+    }
+
+    std::vector<BYTE> buffer(size);
+    if (!GetTokenInformation(token, TokenGroups, buffer.data(), size, &size)) {
+        LogLine(L"读取调用者组信息失败" + FormatWin32Error(GetLastError()));
+        return false;
+    }
+
+    const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(buffer.data());
+    for (DWORD index = 0; index < groups->GroupCount; ++index) {
+        if (EqualSid(groups->Groups[index].Sid, sid)) {
+            return (groups->Groups[index].Attributes & SE_GROUP_ENABLED) != 0;
+        }
+    }
+    return false;
+}
+
 // Checks that the caller's token is a high integrity member of Administrators.
 bool IsElevatedAdministratorToken(HANDLE token, DWORD& error) {
     DWORD rid = 0;
@@ -70,17 +97,11 @@ bool IsElevatedAdministratorToken(HANDLE token, DWORD& error) {
         return false;
     }
 
-    BOOL member = FALSE;
-    const BOOL checked = CheckTokenMembership(token, administrators, &member);
+    const bool member = TokenIsInEnabledGroup(token, administrators);
     FreeSid(administrators);
 
-    if (!checked) {
-        error = GetLastError();
-        LogLine(L"CheckTokenMembership 失败" + FormatWin32Error(error));
-        return false;
-    }
     if (!member) {
-        LogLine(L"调用者不属于 Administrators。");
+        LogLine(L"调用者不属于启用的 Administrators 组。");
         error = ERROR_ACCESS_DENIED;
         return false;
     }
