@@ -23,7 +23,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $workDir = Join-Path $env:TEMP ('uiauf-tests-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 $demo = Join-Path $workDir 'demo.exe'
-Copy-Item (Join-Path $env:WINDIR 'System32\notepad.exe') $demo
+# 用控制台程序而不是 notepad：CI runner 的作业进程在 session 0，没有可见桌面，
+# GUI 程序会启动后立刻退出，check 就抓不到 PID。
+Copy-Item (Join-Path $env:WINDIR 'System32\cmd.exe') $demo
 $script:launchedPid = 0
 
 try {
@@ -51,7 +53,7 @@ try {
     }
 
     Test '启动后令牌带有 UIAccess' {
-        $result = Invoke-Tool $cli @('run', $demo)
+        $result = Invoke-Tool $cli @('run', $demo, '/c', 'ping', '-n', '300', '127.0.0.1')
         Assert-Equal 0 $result.ExitCode ("启动失败：" + $result.Output)
 
         $match = [regex]::Match($result.Output, 'PID\s*=\s*(\d+)')
@@ -76,7 +78,8 @@ try {
             $script:launchedPid = 0
         }
 
-        Copy-Item $env:ComSpec $demo -Force
+        # demo.exe 本身是 cmd.exe 的副本，必须写入不同内容才能制造哈希失配。
+        [IO.File]::WriteAllBytes($demo, [byte[]](1..64))
         $result = Invoke-Tool $cli @('run', $demo)
         Assert-Equal 1 $result.ExitCode '文件被替换后仍被放行'
         Assert-Match $result.Output '哈希' '拒绝原因应为哈希不匹配'

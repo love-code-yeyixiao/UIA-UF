@@ -209,8 +209,12 @@ int CheckCommand(const std::vector<std::wstring>& positional) {
 
     UniqueHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
     if (!process) {
-        std::fwprintf(stderr, L"无法打开进程 %lu: %ls\n", pid,
-                      uiauf::FormatWin32Error(GetLastError()).c_str());
+        const DWORD error = GetLastError();
+        if (error == ERROR_INVALID_PARAMETER) {
+            std::fwprintf(stderr, L"进程 %lu 不存在（可能已经退出）。\n", pid);
+        } else {
+            std::fwprintf(stderr, L"无法打开进程 %lu: %ls\n", pid, uiauf::FormatWin32Error(error).c_str());
+        }
         return 1;
     }
 
