@@ -23,7 +23,8 @@
 - 闲置清理：白名单 15 天未修改且没有可用条目时提醒；宽限期后再过 15 天把服务在 SCM 中
   置为 `DISABLED`（可逆，不删除任何东西）。`--StandaloneSetup` 可关闭。
 - `uiauf notify` 通过 `Shell_NotifyIcon` 发通知，Win10/11 由系统通知中心呈现。
-- 构建：CMake + 静态 CRT；GitHub Actions 构建 / 测试 / 标签发布；`tests/` 为 PowerShell 测试。
+- 构建：CMake + 静态 CRT；exe 带 `VERSIONINFO`（版本号取自 `project(VERSION)`）；
+  GitHub Actions 构建 / 测试 / 标签发布；`tests/` 为 PowerShell 测试。
 
 ### 说明
 

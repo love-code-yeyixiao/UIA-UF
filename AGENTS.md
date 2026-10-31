@@ -91,6 +91,9 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 /permissive- /I src /DUNICODE /D_UNICODE 
 
 构建产物为静态 CRT，不依赖 VC++ 运行库。
 
+版本资源（`src/common/version.rc.in`）由 CMake 用 `project(VERSION)` 生成并链接；
+用上面的 `cl` 命令直接编译时可以跳过它，产物只是缺少文件版本信息。
+
 ### 已知环境问题
 
 - 某些受限环境（沙箱 / 未启用 8.3 短文件名的卷）里，CMake 会把含空格的编译器路径转换成不可访问的短路径
