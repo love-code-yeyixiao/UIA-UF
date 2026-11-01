@@ -13,7 +13,9 @@
 
 - **UIA-UF.Service**：以 `LocalSystem` 运行、按需启动的服务；`--install` / `--uninstall` /
   `--start` / `--stop` / `--console`，`--StandaloneSetup` 表示用户主动安装。
-- **uiauf**：`run` / `check` / `ping` / `hash` / `notify` / `allow list|add|remove`。
+- **uiauf**：`run --cwd` / `check` / `ping` / `hash` / `notify` / `allow list|add|remove`。
+- **UIA-UF.Manager**：菜单式图形入口，所有操作经由 `uiauf`；添加白名单时完整展示哈希并要求
+  确认；可为现有快捷方式生成保留参数、起始位置与图标的 UIAccess 副本。
 - 命名管道（`\\.\pipe\UIA-UF.v1`）自定义帧协议，读写带超时，载荷上限 64 KiB。
 - 启动链路：复制调用者令牌 → `TokenUIAccess` → `CreateProcessAsUser`（`winsta0\default`）；
   进程以挂起状态创建，比对实际映射映像的文件 ID 后才恢复线程。

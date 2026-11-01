@@ -77,7 +77,7 @@ DWORD VerifySuspendedImage(HANDLE process, const ImageIdentity& expected, std::w
 } // namespace
 
 DWORD LaunchWithUIAccess(HANDLE primaryToken, const VerifiedImage& image, const std::wstring& arguments,
-                         DWORD& childPid, std::wstring& errorText) {
+                         const std::wstring& workingDirectory, DWORD& childPid, std::wstring& errorText) {
     childPid = 0;
     errorText.clear();
 
@@ -115,7 +115,8 @@ DWORD LaunchWithUIAccess(HANDLE primaryToken, const VerifiedImage& image, const 
         commandLine += arguments;
     }
 
-    const std::wstring workingDirectory = ParentDirectory(executable);
+    const std::wstring directory =
+        workingDirectory.empty() ? ParentDirectory(executable) : workingDirectory;
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -129,8 +130,8 @@ DWORD LaunchWithUIAccess(HANDLE primaryToken, const VerifiedImage& image, const 
     const BOOL created = CreateProcessAsUserW(primaryToken, executable.c_str(), commandLine.data(), nullptr,
                                               nullptr, FALSE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
                                               environment,
-                                              workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
-                                              &startup, &child);
+                                              directory.empty() ? nullptr : directory.c_str(), &startup,
+                                              &child);
 
     if (hasEnvironment) {
         DestroyEnvironmentBlock(environment);

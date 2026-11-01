@@ -18,7 +18,8 @@ DWORD DuplicateClientPrimaryToken(UniqueHandle& token, std::wstring& callerName)
 // interactive desktop of that token's session. The process is created
 // suspended, its mapped image is compared against `image.identity`, and only
 // then resumed. `image.file` must stay open for the duration of this call.
+// An empty `workingDirectory` falls back to the executable's own directory.
 DWORD LaunchWithUIAccess(HANDLE primaryToken, const VerifiedImage& image, const std::wstring& arguments,
-                         DWORD& childPid, std::wstring& errorText);
+                         const std::wstring& workingDirectory, DWORD& childPid, std::wstring& errorText);
 
 } // namespace uiauf

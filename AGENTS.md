@@ -28,7 +28,9 @@ UIA-UF 让用户自己维护的桌面软件获得 `TokenUIAccess`（窗口层级
 | `src/service/launcher.cpp` | 启用特权、`TokenUIAccess`、`CreateProcessAsUser` |
 | `src/service/allowlist.cpp` | 最终路径解析 + 哈希校验 + 加载 HKLM 白名单 |
 | `src/service/log.cpp` | `%ProgramData%\UIA-UF\service.log` |
-| `src/cli/main.cpp` | `run` / `check` / `ping` / `allow` 子命令 |
+| `src/cli/main.cpp` | `run` / `check` / `ping` / `hash` / `notify` / `allow` 子命令 |
+| `src/cli/toast.cpp` | `Shell_NotifyIcon` 通知 |
+| `src/tool/main.cpp` | `UIA-UF.Manager.exe`：菜单式入口，只调用 `uiauf`，不重复实现逻辑 |
 
 一次启动请求的完整链路：
 

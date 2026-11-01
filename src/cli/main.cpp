@@ -29,10 +29,10 @@ void PrintUsage() {
                   L"uiauf.exe -- UIAccess 启动器\n"
                   L"\n"
                   L"用法:\n"
-                  L"  uiauf run <可执行文件> [参数...] [--wait]   以 UIAccess 启动程序\n"
+                  L"  uiauf run <可执行文件> [参数...] [--wait] [--cwd <目录>]   以 UIAccess 启动程序\n"
                   L"  uiauf check <PID>                          查看进程是否具有 UIAccess\n"
                   L"  uiauf ping                                 检查服务是否在线\n"
-                  L"  uiauf allow list                           列出白名单\n"
+                  L"  uiauf allow list [--tsv]                    列出白名单\n"
                   L"  uiauf allow add <文件> --sha256 <哈希>      注册白名单条目（管理员）\n"
                   L"  uiauf allow remove <名称>                  删除白名单条目（管理员）\n"
                   L"  uiauf hash <文件>                          计算文件的 SHA-256\n"
@@ -241,7 +241,8 @@ std::wstring JoinArguments(const std::vector<std::wstring>& arguments, size_t fi
     return commandLine;
 }
 
-int RunCommand(const std::vector<std::wstring>& positional, bool waitForExit) {
+int RunCommand(const std::vector<std::wstring>& positional, bool waitForExit,
+               const std::wstring& workingDirectory) {
     if (positional.size() < 2) {
         std::fwprintf(stderr, L"run: 缺少可执行文件路径。\n");
         return 2;
@@ -263,7 +264,7 @@ int RunCommand(const std::vector<std::wstring>& positional, bool waitForExit) {
         return ReportServiceUnavailable(error);
     }
 
-    const std::vector<std::byte> payload = uiauf::MakeLaunchPayload(executable, arguments);
+    const std::vector<std::byte> payload = uiauf::MakeLaunchPayload(executable, arguments, workingDirectory);
     error = uiauf::SendMessage(pipe.get(), uiauf::MessageType::Launch, payload.data(),
                                static_cast<uint32_t>(payload.size()));
     if (error != ERROR_SUCCESS) {
@@ -419,7 +420,7 @@ int SendAllowRequest(const wchar_t* label, uiauf::MessageType requestType,
     return 0;
 }
 
-int AllowListCommand() {
+int AllowListCommand(bool tsv) {
     DWORD error = ERROR_SUCCESS;
     UniqueHandle pipe = ConnectToService(error);
     if (!pipe) {
@@ -444,6 +445,15 @@ int AllowListCommand() {
     if (!uiauf::ParseStringPayload(response.data(), response.size(), parts) || parts.size() % 3 != 0) {
         std::fwprintf(stderr, L"白名单响应格式错误。\n");
         return 1;
+    }
+
+    if (tsv) {
+        // 供脚本和 UI 解析：名称<TAB>路径<TAB>哈希，一行一条。
+        for (size_t index = 0; index + 2 < parts.size(); index += 3) {
+            std::wprintf(L"%ls\t%ls\t%ls\n", parts[index].c_str(), parts[index + 1].c_str(),
+                         parts[index + 2].c_str());
+        }
+        return 0;
     }
 
     if (parts.empty()) {
@@ -550,7 +560,9 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring_view command = argv[1];
     std::vector<std::wstring> positional;
     bool waitForExit = false;
+    bool tsvOutput = false;
     std::wstring expectedSha256;
+    std::wstring workingDirectory;
 
     if (command == L"notify") {
         return NotifyCommand(argc, argv);
@@ -559,6 +571,16 @@ int wmain(int argc, wchar_t** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--wait") == 0) {
             waitForExit = true;
+            continue;
+        }
+        if (std::wcscmp(argv[i], L"--tsv") == 0) {
+            tsvOutput = true;
+            continue;
+        }
+        if (std::wcscmp(argv[i], L"--cwd") == 0) {
+            if (i + 1 < argc) {
+                workingDirectory = argv[++i];
+            }
             continue;
         }
         if (std::wcscmp(argv[i], L"--sha256") == 0) {
@@ -571,7 +593,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (command == L"run") {
-        return RunCommand(positional, waitForExit);
+        return RunCommand(positional, waitForExit, workingDirectory);
     }
     if (command == L"check") {
         return CheckCommand(positional);
@@ -588,7 +610,7 @@ int wmain(int argc, wchar_t** argv) {
             return 2;
         }
         if (positional[1] == L"list") {
-            return AllowListCommand();
+            return AllowListCommand(tsvOutput);
         }
         if (positional[1] == L"add") {
             return AllowAddCommand(positional, expectedSha256);

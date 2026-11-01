@@ -63,6 +63,12 @@ try {
         Assert-Match $result.Output '[0-9a-f]{64}' '列表中没有 64 位哈希'
     }
 
+    Test '列表的 TSV 格式可解析' {
+        $result = Invoke-Tool $cli @('allow', 'list', '--tsv')
+        Assert-Equal 0 $result.ExitCode ("列表失败：" + $result.Output)
+        Assert-Match $result.Output.Trim() '^demo\t.+\.exe\t[0-9a-f]{64}$' 'TSV 行格式不对'
+    }
+
     Test '启动后令牌带有 UIAccess' {
         $result = Invoke-Tool $cli @('run', $demo, '/c', 'ping', '-n', '300', '127.0.0.1')
         Assert-Equal 0 $result.ExitCode ("启动失败：" + $result.Output)
@@ -80,6 +86,24 @@ try {
         $result = Invoke-Tool $cli @('run', (Join-Path $env:WINDIR 'System32\notepad.exe'))
         Assert-Equal 1 $result.ExitCode '未登记的程序应被拒绝'
         Assert-Match $result.Output '不在白名单' '拒绝原因应为"不在白名单"，而不是其他失败'
+    }
+
+    Test 'run --cwd 使用指定的工作目录' {
+        $probeDir = Join-Path $workDir 'cwd-probe'
+        New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+        $probe = Join-Path $workDir 'cwd.txt'
+        Remove-Item $probe -ErrorAction SilentlyContinue
+
+        $result = Invoke-Tool $cli @('run', $demo, '/c', 'cd', '>', $probe, '--cwd', $probeDir)
+        Assert-Equal 0 $result.ExitCode ("启动失败：" + $result.Output)
+
+        for ($attempt = 0; $attempt -lt 30 -and -not (Test-Path $probe); $attempt++) {
+            Start-Sleep -Milliseconds 100
+        }
+        Assert-True (Test-Path $probe) '没有生成工作目录探针文件'
+
+        $actual = (Get-Content $probe -Raw).Trim()
+        Assert-Match $actual 'cwd-probe' '子进程没有使用 --cwd 指定的目录'
     }
 
     Test '替换文件后哈希失配被拒绝' {

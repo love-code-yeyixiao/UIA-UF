@@ -64,6 +64,15 @@ Test 'hash 输出 64 位十六进制' {
     Assert-Match $result.Output.Trim() '^[0-9a-f]{64}$' 'hash 输出不是 64 位十六进制'
 }
 
+Test '管理器可启动并正常退出' {
+    $manager = Join-Path $script:BinDir 'UIA-UF.Manager.exe'
+    Assert-True (Test-Path $manager) "缺少 $manager"
+
+    $output = "0" | & $manager 2>&1 | Out-String
+    Assert-Equal 0 $LASTEXITCODE ("管理器退出码异常：" + $output)
+    Assert-Match $output 'UIA-UF' '管理器没有输出标题'
+}
+
 Test 'allow 未知子命令返回 2' {
     $result = Invoke-Tool $cli @('allow', 'frobnicate')
     Assert-Equal 2 $result.ExitCode 'allow 未知子命令应返回 2'

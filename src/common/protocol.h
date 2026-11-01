@@ -26,7 +26,7 @@ inline constexpr wchar_t kServiceDescription[] =
 inline constexpr wchar_t kRegistryAllowKey[] = L"SOFTWARE\\UIA-UF\\Allow";
 
 inline constexpr uint32_t kProtocolMagic = 0x46414955u; // 'U','I','A','F'
-inline constexpr uint16_t kProtocolVersion = 2;
+inline constexpr uint16_t kProtocolVersion = 3;
 inline constexpr uint32_t kMaxPayloadBytes = 64u * 1024u;
 
 // Allow list administration lives in a key whose DACL only grants write access
@@ -77,27 +77,31 @@ struct OperationResult {
 #pragma pack(pop)
 #pragma warning(pop)
 
-// Launch payload: exe path and command line arguments, each a NUL terminated
-// UTF-16 string, the second one directly following the first terminator.
-inline std::vector<std::byte> MakeLaunchPayload(std::wstring_view exe, std::wstring_view args) {
-    const size_t chars = exe.size() + 1 + args.size() + 1;
+// Launch payload: executable path, command line arguments and working directory,
+// each a NUL terminated UTF-16 string.
+inline std::vector<std::byte> MakeLaunchPayload(std::wstring_view exe, std::wstring_view args,
+                                                std::wstring_view workingDirectory) {
+    const size_t chars = exe.size() + 1 + args.size() + 1 + workingDirectory.size() + 1;
     std::vector<std::byte> payload(chars * sizeof(wchar_t));
     wchar_t* cursor = reinterpret_cast<wchar_t*>(payload.data());
-    if (!exe.empty()) {
-        std::memcpy(cursor, exe.data(), exe.size() * sizeof(wchar_t));
-    }
-    cursor += exe.size();
-    *cursor++ = L'\0';
-    if (!args.empty()) {
-        std::memcpy(cursor, args.data(), args.size() * sizeof(wchar_t));
-    }
-    cursor += args.size();
-    *cursor = L'\0';
+
+    auto append = [&cursor](std::wstring_view text) {
+        if (!text.empty()) {
+            std::memcpy(cursor, text.data(), text.size() * sizeof(wchar_t));
+        }
+        cursor += text.size();
+        *cursor++ = L'\0';
+    };
+
+    append(exe);
+    append(args);
+    append(workingDirectory);
     return payload;
 }
 
-inline bool ParseLaunchPayload(const std::byte* data, size_t size, std::wstring& exe, std::wstring& args) {
-    if (size < 2 * sizeof(wchar_t) || size % sizeof(wchar_t) != 0) {
+inline bool ParseLaunchPayload(const std::byte* data, size_t size, std::wstring& exe, std::wstring& args,
+                               std::wstring& workingDirectory) {
+    if (size < 3 * sizeof(wchar_t) || size % sizeof(wchar_t) != 0) {
         return false;
     }
 
@@ -107,18 +111,21 @@ inline bool ParseLaunchPayload(const std::byte* data, size_t size, std::wstring&
         return false;
     }
 
-    size_t exeLength = 0;
-    while (exeLength < count && text[exeLength] != L'\0') {
-        ++exeLength;
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (text[i] == L'\0') {
+            parts.emplace_back(text + start, i - start);
+            start = i + 1;
+        }
     }
-    if (exeLength == count) {
+    if (parts.size() != 3) {
         return false;
     }
 
-    const size_t argsStart = exeLength + 1;
-    const size_t argsLength = count - argsStart - 1;
-    exe.assign(text, exeLength);
-    args.assign(text + argsStart, argsLength);
+    exe = std::move(parts[0]);
+    args = std::move(parts[1]);
+    workingDirectory = std::move(parts[2]);
     return true;
 }
 

@@ -58,6 +58,15 @@ add_executable(uiauf src/cli/main.cpp src/cli/toast.cpp)
 target_link_libraries(uiauf PRIVATE uiauf_common advapi32 bcrypt shell32 user32)
 uiauf_add_version_resource(uiauf "UIA-UF" "uiauf" "uiauf.exe")
 
+# ---------------------------------------------------------------------------
+# UIA-UF.Manager.exe -- menu driven front end. It owns no business logic: every
+# action is performed by invoking uiauf.exe next to it.
+# ---------------------------------------------------------------------------
+add_executable(uiauf_manager src/tool/main.cpp)
+set_target_properties(uiauf_manager PROPERTIES OUTPUT_NAME "UIA-UF.Manager")
+target_link_libraries(uiauf_manager PRIVATE uiauf_common advapi32 comdlg32 shell32 ole32 uuid)
+uiauf_add_version_resource(uiauf_manager "UIA-UF Manager" "UIA-UF.Manager" "UIA-UF.Manager.exe")
+
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT uiauf)
 
-install(TARGETS uiauf_service uiauf RUNTIME DESTINATION bin)
+install(TARGETS uiauf_service uiauf uiauf_manager RUNTIME DESTINATION bin)

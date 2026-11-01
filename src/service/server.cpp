@@ -260,7 +260,8 @@ void ServiceServer::HandleLaunch(HANDLE pipe, const std::vector<std::byte>& payl
 
     std::wstring executable;
     std::wstring arguments;
-    if (!ParseLaunchPayload(payload.data(), payload.size(), executable, arguments)) {
+    std::wstring workingDirectory;
+    if (!ParseLaunchPayload(payload.data(), payload.size(), executable, arguments, workingDirectory)) {
         result.status = ERROR_INVALID_DATA;
         SetResultMessage(result, L"请求格式错误。");
         return;
@@ -298,7 +299,7 @@ void ServiceServer::HandleLaunch(HANDLE pipe, const std::vector<std::byte>& payl
 
     DWORD childPid = 0;
     std::wstring failure;
-    error = LaunchWithUIAccess(clientToken.get(), image, arguments, childPid, failure);
+    error = LaunchWithUIAccess(clientToken.get(), image, arguments, workingDirectory, childPid, failure);
     if (error != ERROR_SUCCESS) {
         result.status = error;
         SetResultMessage(result, failure);
