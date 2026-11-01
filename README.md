@@ -29,7 +29,7 @@ cmake --preset debug      # 或 --preset release / vs2022
 cmake --build --preset debug
 ```
 
-产物：`build/debug/UIA-UF.Service.exe`、`build/debug/uiauf.exe`。
+产物：`build/debug/UIA-UF.Service.exe`、`build/debug/uiauf.exe`、`build/debug/UIA-UF.Manager.exe`。
 
 CI 在 `windows-2022` 上构建 Debug 与 Release 两个配置，跑 `tests/` 下的测试，
 产物可在 Actions 页面下载；推送 `v*` 标签会自动创建 Release 并附上 Release 版 zip。

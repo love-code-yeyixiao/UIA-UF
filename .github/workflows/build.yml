@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = "build\${{ matrix.configuration }}"
-          foreach ($name in @("uiauf.exe", "UIA-UF.Service.exe")) {
+          foreach ($name in @("uiauf.exe", "UIA-UF.Service.exe", "UIA-UF.Manager.exe")) {
             if (-not (Test-Path (Join-Path $dir $name))) { throw "missing $dir\$name" }
           }
           & (Join-Path $dir "uiauf.exe") help | Out-Null
@@ -47,9 +47,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: UIA-UF-${{ matrix.configuration }}
-          path: |
-            build/${{ matrix.configuration }}/uiauf.exe
-            build/${{ matrix.configuration }}/UIA-UF.Service.exe
+          # 通配符而不是逐个列举：新增可执行目标时不会再漏掉
+          path: build/${{ matrix.configuration }}/*.exe
           if-no-files-found: error
 
   test:
